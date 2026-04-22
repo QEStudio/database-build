@@ -1,0 +1,787 @@
+name: Cache MongoDB Multi-Version
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/cache-mongodb.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/cache-mongodb.yml'
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      mongo_versions:
+        description: 'MongoDB versions (comma-separated: 4.4,5.0,6.0,7.0,8.2)'
+        required: false
+        default: '4.4,5.0,6.0,7.0,8.2'
+      architectures:
+        description: 'Architectures (comma-separated: amd64,arm64)'
+        required: false
+        default: 'amd64,arm64'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Job 1: 生成下载矩阵 + release 信息
+  # ============================================================
+  prepare:
+    name: Prepare Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:         ${{ steps.gen.outputs.matrix }}
+      release_tag:    ${{ steps.gen.outputs.release_tag }}
+      should_release: ${{ steps.gen.outputs.should_release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate matrix
+        id: gen
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+
+          CST = timezone(timedelta(hours=8))
+          date_tag = datetime.now(CST).strftime('%Y%m%d')
+
+          # ----------------------------------------------------------------
+          # 版本表：每个版本每个架构对应一条下载记录
+          # debian_ver: 官方包使用的 debian 代号（影响 URL）
+          # amd64_full / arm64_full: 实际完整版本号（patch）
+          # ----------------------------------------------------------------
+          VERSION_TABLE = {
+            '4.4': {
+              'full':       '4.4.30',
+              'amd64': {
+                'os_label': 'debian10',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian10-4.4.30.tgz',
+                'tarball':  'mongodb-linux-x86_64-debian10-4.4.30.tgz',
+                'src_dir':  'mongodb-linux-x86_64-debian10-4.4.30',
+              },
+              'arm64': {
+                'os_label': 'debian10',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-aarch64-debian10-4.4.30.tgz',
+                'tarball':  'mongodb-linux-aarch64-debian10-4.4.30.tgz',
+                'src_dir':  'mongodb-linux-aarch64-debian10-4.4.30',
+              },
+            },
+            '5.0': {
+              'full':       '5.0.32',
+              'amd64': {
+                'os_label': 'debian11',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian11-5.0.32.tgz',
+                'tarball':  'mongodb-linux-x86_64-debian11-5.0.32.tgz',
+                'src_dir':  'mongodb-linux-x86_64-debian11-5.0.32',
+              },
+              'arm64': {
+                'os_label': 'debian11',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-aarch64-debian11-5.0.32.tgz',
+                'tarball':  'mongodb-linux-aarch64-debian11-5.0.32.tgz',
+                'src_dir':  'mongodb-linux-aarch64-debian11-5.0.32',
+              },
+            },
+            '6.0': {
+              'full':       '6.0.27',
+              'amd64': {
+                'os_label': 'debian11',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian11-6.0.27.tgz',
+                'tarball':  'mongodb-linux-x86_64-debian11-6.0.27.tgz',
+                'src_dir':  'mongodb-linux-x86_64-debian11-6.0.27',
+              },
+              'arm64': {
+                'os_label': 'debian11',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-aarch64-debian11-6.0.27.tgz',
+                'tarball':  'mongodb-linux-aarch64-debian11-6.0.27.tgz',
+                'src_dir':  'mongodb-linux-aarch64-debian11-6.0.27',
+              },
+            },
+            '7.0': {
+              'full':       '7.0.30',
+              'amd64': {
+                'os_label': 'debian12',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian12-7.0.30.tgz',
+                'tarball':  'mongodb-linux-x86_64-debian12-7.0.30.tgz',
+                'src_dir':  'mongodb-linux-x86_64-debian12-7.0.30',
+              },
+              'arm64': {
+                'os_label': 'debian12',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-aarch64-debian12-7.0.30.tgz',
+                'tarball':  'mongodb-linux-aarch64-debian12-7.0.30.tgz',
+                'src_dir':  'mongodb-linux-aarch64-debian12-7.0.30',
+              },
+            },
+            '8.2': {
+              'full':       '8.2.6',
+              'amd64': {
+                'os_label': 'debian12',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-debian12-8.2.6.tgz',
+                'tarball':  'mongodb-linux-x86_64-debian12-8.2.6.tgz',
+                'src_dir':  'mongodb-linux-x86_64-debian12-8.2.6',
+              },
+              'arm64': {
+                'os_label': 'debian12',
+                'url':      'https://fastdl.mongodb.org/linux/mongodb-linux-aarch64-debian12-8.2.6.tgz',
+                'tarball':  'mongodb-linux-aarch64-debian12-8.2.6.tgz',
+                'src_dir':  'mongodb-linux-aarch64-debian12-8.2.6',
+              },
+            },
+          }
+
+          req_versions = os.environ.get('INPUT_VERSIONS', '4.4,5.0,6.0,7.0,8.2').split(',')
+          req_versions = [v.strip() for v in req_versions if v.strip()]
+          req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
+          req_arches   = [a.strip() for a in req_arches if a.strip()]
+
+          include = []
+          for ver in req_versions:
+            if ver not in VERSION_TABLE:
+              print(f'WARNING: unknown version {ver}, skip')
+              continue
+            cfg = VERSION_TABLE[ver]
+            for arch in req_arches:
+              if arch not in cfg:
+                print(f'WARNING: no {arch} package for {ver}, skip')
+                continue
+              acfg = cfg[arch]
+              include.append({
+                'version':      ver,
+                'full_version': cfg['full'],
+                'build_arch':   arch,
+                'os_label':     acfg['os_label'],
+                'url':          acfg['url'],
+                'tarball':      acfg['tarball'],
+                'src_dir':      acfg['src_dir'],
+              })
+
+          event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
+          ref     = os.environ.get('GITHUB_REF', '')
+          run_num = os.environ.get('GITHUB_RUN_NUMBER', '0')
+
+          if event == 'push' and ref.startswith('refs/tags/'):
+            release_tag    = ref.replace('refs/tags/', '')
+            should_release = 'true'
+          elif event == 'schedule':
+            release_tag    = f'nightly-{date_tag}'
+            should_release = 'true'
+          elif event in ('push', 'workflow_dispatch') and \
+               ref in ('refs/heads/main', 'refs/heads/master'):
+            release_tag    = f'build-{date_tag}-{run_num}'
+            should_release = 'true'
+          else:
+            release_tag    = f'dev-{date_tag}'
+            should_release = 'false'
+
+          matrix = json.dumps({'include': include})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'matrix={matrix}\n')
+            f.write(f'release_tag={release_tag}\n')
+            f.write(f'should_release={should_release}\n')
+
+          print(f'Matrix ({len(include)} jobs):')
+          for e in include:
+            print(f"  MongoDB {e['full_version']} / {e['build_arch']} "
+                  f"({e['os_label']}) <- {e['tarball']}")
+          print(f'Release tag : {release_tag}')
+          print(f'Should release: {should_release}')
+          PYEOF
+        env:
+          INPUT_VERSIONS:    ${{ github.event.inputs.mongo_versions || '4.4,5.0,6.0,7.0,8.2' }}
+          INPUT_ARCHES:      ${{ github.event.inputs.architectures  || 'amd64,arm64' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF:        ${{ github.ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+  # ============================================================
+  # Job 2: 下载 + 重打包（每个版本×架构一个 job）
+  # ============================================================
+  repack:
+    name: "MongoDB ${{ matrix.full_version }} / ${{ matrix.build_arch }}"
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 6
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. 恢复缓存（以原始 tarball 为单位缓存，key = 版本+arch）
+      # ------------------------------------------------------------------
+      - name: Restore download cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: dl/${{ matrix.tarball }}
+          key: mongodb-dl-${{ matrix.full_version }}-${{ matrix.build_arch }}
+
+      # ------------------------------------------------------------------
+      # 2. 下载（未命中缓存时）
+      # ------------------------------------------------------------------
+      - name: Download MongoDB binary package
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p dl
+          echo "Downloading ${{ matrix.tarball }}"
+          for attempt in 1 2 3 4 5; do
+            if curl -fSL \
+                --retry 3 --retry-delay 15 \
+                --connect-timeout 30 --max-time 1800 \
+                -o "dl/${{ matrix.tarball }}" \
+                "${{ matrix.url }}"; then
+              echo "Downloaded on attempt ${attempt}"
+              break
+            fi
+            echo "Attempt ${attempt} failed, waiting 20s..."
+            sleep 20
+            if [[ ${attempt} -eq 5 ]]; then
+              echo "::error::Download failed after 5 attempts"
+              exit 1
+            fi
+          done
+
+      # ------------------------------------------------------------------
+      # 3. 校验
+      # ------------------------------------------------------------------
+      - name: Integrity check
+        run: |
+          FILE="dl/${{ matrix.tarball }}"
+          SIZE=$(stat -c%s "${FILE}")
+          echo "File: ${FILE}, Size: $(numfmt --to=iec ${SIZE})"
+          if [[ ${SIZE} -lt 20971520 ]]; then
+            echo "::error::File too small (${SIZE} bytes), likely a download error"
+            exit 1
+          fi
+          file "${FILE}" | grep -qiE 'gzip|tar' || {
+            echo "::error::Not a valid .tgz file"
+            exit 1
+          }
+          echo "Integrity check passed"
+
+      # ------------------------------------------------------------------
+      # 4. 解压 + 重打包（统一目录结构 + 管理脚本）
+      # ------------------------------------------------------------------
+      - name: Repack with unified layout and scripts
+        run: |
+          set -euo pipefail
+
+          FULL="${{ matrix.full_version }}"
+          BUILD_ARCH="${{ matrix.build_arch }}"
+          OS_LABEL="${{ matrix.os_label }}"
+          SRC_DIR="${{ matrix.src_dir }}"
+          TARBALL="dl/${{ matrix.tarball }}"
+          INSTALL_NAME="mongodb-${FULL}"
+          WORK_DIR="work"
+          OUT_DIR="output"
+          INSTALL_DIR="${WORK_DIR}/${INSTALL_NAME}"
+
+          mkdir -p "${WORK_DIR}" "${OUT_DIR}"
+
+          # ---- 解压官方包 ----
+          echo "Extracting ${TARBALL}..."
+          tar -xzf "${TARBALL}" -C "${WORK_DIR}"
+          [[ -d "${WORK_DIR}/${SRC_DIR}" ]] || {
+            echo "ERROR: expected directory ${WORK_DIR}/${SRC_DIR} not found"
+            ls -la "${WORK_DIR}/"
+            exit 1
+          }
+
+          # ---- 重命名为统一目录名 ----
+          mv "${WORK_DIR}/${SRC_DIR}" "${INSTALL_DIR}"
+
+          # ---- 创建统一目录结构 ----
+          mkdir -p \
+            "${INSTALL_DIR}/data" \
+            "${INSTALL_DIR}/logs" \
+            "${INSTALL_DIR}/run" \
+            "${INSTALL_DIR}/tmp" \
+            "${INSTALL_DIR}/etc" \
+            "${INSTALL_DIR}/scripts"
+
+          # ---- 生成默认配置文件 ----
+          cat > "${INSTALL_DIR}/etc/mongod.conf.default" << 'MONGOCFG'
+          # MongoDB default configuration template
+          # Generated by GH Actions build
+          # Reference: https://www.mongodb.com/docs/manual/reference/configuration-options/
+
+          systemLog:
+            destination: file
+            path: __BASEDIR__/logs/mongod.log
+            logAppend: true
+            logRotate: reopen
+
+          storage:
+            dbPath: __BASEDIR__/data
+            journal:
+              enabled: true
+
+          net:
+            port: 27017
+            bindIp: 127.0.0.1
+
+          processManagement:
+            fork: false
+            pidFilePath: __BASEDIR__/run/mongod.pid
+
+          # security:
+          #   authorization: enabled
+
+          # replication:
+          #   replSetName: rs0
+          MONGOCFG
+
+          # ---- 管理脚本 ----
+
+          # init-config.sh：初始化配置（替换占位符）
+          cat > "${INSTALL_DIR}/scripts/init-config.sh" << 'INITSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+          PORT="${PORT:-27017}"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          LOGFILE="${LOGFILE:-${BASEDIR}/logs/mongod.log}"
+          PIDFILE="${PIDFILE:-${BASEDIR}/run/mongod.pid}"
+
+          if [[ -f "${CONFIG}" ]]; then
+            echo "Config already exists: ${CONFIG}"
+            echo "Delete it first if you want to reinitialize."
+            exit 0
+          fi
+
+          mkdir -p "${DATADIR}" \
+                   "$(dirname "${LOGFILE}")" \
+                   "$(dirname "${PIDFILE}")" \
+                   "${BASEDIR}/tmp"
+
+          sed \
+            -e "s|__BASEDIR__|${BASEDIR}|g" \
+            "${BASEDIR}/etc/mongod.conf.default" \
+            > "${CONFIG}"
+
+          # 替换端口
+          sed -i "s|^    port: .*|    port: ${PORT}|" "${CONFIG}"
+          # 替换路径
+          sed -i "s|path: .*logs/mongod.log|path: ${LOGFILE}|" "${CONFIG}"
+          sed -i "s|dbPath: .*data|dbPath: ${DATADIR}|"        "${CONFIG}"
+          sed -i "s|pidFilePath: .*run/mongod.pid|pidFilePath: ${PIDFILE}|" "${CONFIG}"
+
+          echo "Config generated: ${CONFIG}"
+          echo "Data dir       : ${DATADIR}"
+          echo "Log file       : ${LOGFILE}"
+          echo "Port           : ${PORT}"
+          INITSCRIPT
+
+          # start-mongod.sh
+          cat > "${INSTALL_DIR}/scripts/start-mongod.sh" << 'STARTSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+
+          if [[ ! -f "${CONFIG}" ]]; then
+            echo "Config not found: ${CONFIG}"
+            echo "Run first: ${BASEDIR}/scripts/init-config.sh"
+            exit 1
+          fi
+
+          mkdir -p \
+            "${BASEDIR}/data" \
+            "${BASEDIR}/logs" \
+            "${BASEDIR}/run" \
+            "${BASEDIR}/tmp"
+
+          exec "${BASEDIR}/bin/mongod" \
+            --config "${CONFIG}" \
+            "$@"
+          STARTSCRIPT
+
+          # stop-mongod.sh
+          cat > "${INSTALL_DIR}/scripts/stop-mongod.sh" << 'STOPSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+          PORT="${PORT:-27017}"
+          HOST="${HOST:-127.0.0.1}"
+
+          # 优先用 mongosh，降级用 mongo
+          MONGO_CMD=""
+          for candidate in "${BASEDIR}/bin/mongosh" "${BASEDIR}/bin/mongo"; do
+            [[ -f "${candidate}" ]] && { MONGO_CMD="${candidate}"; break; }
+          done
+
+          if [[ -n "${MONGO_CMD}" ]]; then
+            "${MONGO_CMD}" \
+              --host "${HOST}" --port "${PORT}" \
+              --eval 'db.adminCommand({ shutdown: 1, force: true })' \
+              admin 2>/dev/null || true
+          else
+            # 没有 shell，直接 kill
+            PID_FILE="${BASEDIR}/run/mongod.pid"
+            if [[ -f "${PID_FILE}" ]]; then
+              PID=$(cat "${PID_FILE}")
+              echo "Sending SIGTERM to PID ${PID}..."
+              kill "${PID}" 2>/dev/null || echo "Process not found"
+            else
+              echo "PID file not found: ${PID_FILE}"
+            fi
+          fi
+          STOPSCRIPT
+
+          # status-mongod.sh
+          cat > "${INSTALL_DIR}/scripts/status-mongod.sh" << 'STATUSSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PID_FILE="${BASEDIR}/run/mongod.pid"
+          PORT="${PORT:-27017}"
+          if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+            echo "mongod is RUNNING (PID=$(cat "${PID_FILE}"), PORT=${PORT})"
+          else
+            echo "mongod is NOT running"
+          fi
+          STATUSSCRIPT
+
+          # mongo-shell.sh（兼容 mongosh / mongo）
+          cat > "${INSTALL_DIR}/scripts/mongo-shell.sh" << 'SHELLSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-27017}"
+          HOST="${HOST:-127.0.0.1}"
+          for candidate in "${BASEDIR}/bin/mongosh" "${BASEDIR}/bin/mongo"; do
+            if [[ -f "${candidate}" ]]; then
+              exec "${candidate}" \
+                --host "${HOST}" --port "${PORT}" \
+                "$@"
+            fi
+          done
+          echo "ERROR: neither mongosh nor mongo found in ${BASEDIR}/bin/"
+          exit 1
+          SHELLSCRIPT
+
+          chmod +x "${INSTALL_DIR}/scripts/"*.sh
+
+          # ---- 验证 ----
+          echo "--- Binary check ---"
+          FAIL=0
+          for bin in mongod; do
+            BIN_PATH="${INSTALL_DIR}/bin/${bin}"
+            if [[ -f "${BIN_PATH}" ]]; then
+              echo "  OK  ${bin}"
+              ldd "${BIN_PATH}" 2>/dev/null | grep 'not found' && \
+                echo "  WARNING: unresolved deps" || true
+            else
+              echo "  MISSING ${bin}"
+              FAIL=1
+            fi
+          done
+          [[ "${FAIL}" == "0" ]] || { echo "ERROR: required binaries missing"; exit 1; }
+
+          echo "--- Version ---"
+          "${INSTALL_DIR}/bin/mongod" --version
+
+          echo "--- Contents ---"
+          ls -lh "${INSTALL_DIR}/bin/"
+
+          # ---- 打包 ----
+          PKG_NAME="mongodb-${FULL}-${OS_LABEL}-${BUILD_ARCH}"
+          cd "${WORK_DIR}"
+          tar -czf "../${OUT_DIR}/${PKG_NAME}.tar.gz" "${INSTALL_NAME}/"
+
+          cd "../${OUT_DIR}"
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          SHA256=$(sha256sum "${PKG_NAME}.tar.gz" | cut -d' ' -f1)
+
+          cat > "${PKG_NAME}.json" << JSON
+          {
+            "mongo_version": "${FULL}",
+            "major_version": "${{ matrix.version }}",
+            "arch":          "${BUILD_ARCH}",
+            "os_label":      "${OS_LABEL}",
+            "source":        "official-prebuilt",
+            "package":       "${PKG_NAME}.tar.gz",
+            "sha256":        "${SHA256}",
+            "build_date":    "${BUILD_DATE}",
+            "workflow_run":  "${{ github.run_number }}"
+          }
+          JSON
+
+          echo "Package ready:"
+          ls -lh "../${OUT_DIR}/"
+
+      # ------------------------------------------------------------------
+      # 5. 上传产物
+      # ------------------------------------------------------------------
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-${{ matrix.full_version }}-${{ matrix.os_label }}-${{ matrix.build_arch }}
+          path: output/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-mongodb-${{ matrix.full_version }}-${{ matrix.os_label }}-${{ matrix.build_arch }}
+          path: output/*.sha256
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-mongodb-${{ matrix.full_version }}-${{ matrix.os_label }}-${{ matrix.build_arch }}
+          path: output/*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 3: 发布 Release
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [prepare, repack]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download tar.gz artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mongodb-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download sha256 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sha256-mongodb-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download json artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: json-mongodb-*
+          path: release/
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          cd release
+          echo "=== Release contents ==="
+          ls -lhR
+          echo ""
+          echo "=== SHA256SUMS ==="
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          DATE_CN=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
+          REPO="${{ github.repository }}"
+          COMMIT="${{ github.sha }}"
+
+          cat > release-notes.md << NOTES
+          ## MongoDB Multi-Version Cache - ${TAG}
+
+          > **Source**: Official MongoDB prebuilt binaries, repackaged with unified
+          > directory layout and management scripts.
+
+          | Item | Value |
+          |------|-------|
+          | Build time | ${DATE_CN} |
+          | Trigger | ${{ github.event_name }} |
+          | Commit | ${COMMIT:0:8} |
+          | Run | #${{ github.run_number }} |
+
+          ---
+
+          ### Packages
+
+          | Version | Full | Build OS | amd64 | arm64 |
+          |---------|------|----------|-------|-------|
+          | 4.4 | 4.4.30 | debian10 | ✅ | ✅ |
+          | 5.0 | 5.0.32 | debian11 | ✅ | ✅ |
+          | 6.0 | 6.0.27 | debian11 | ✅ | ✅ |
+          | 7.0 | 7.0.30 | debian12 | ✅ | ✅ |
+          | 8.2 | 8.2.6  | debian12 | ✅ | ✅ |
+
+          > **Note**: arm64 packages use MongoDB's official `aarch64` builds.
+          > Minimum glibc requirement varies by OS label (debian10=2.28, debian11=2.31, debian12=2.36).
+
+          ---
+
+          ### Install
+
+          \`\`\`bash
+          # Example: MongoDB 7.0.30 on amd64 / debian12
+          ASSET="mongodb-7.0.30-debian12-amd64.tar.gz"
+          wget https://github.com/${REPO}/releases/download/${TAG}/\${ASSET}
+          wget https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+
+          # Extract to /opt (or any directory)
+          sudo tar -xzf \${ASSET} -C /opt/
+          # or user-local
+          tar -xzf \${ASSET} -C ~/
+
+          # Initialize config (first time)
+          PORT=27017 \\
+          DATADIR=/opt/mongodb-7.0.30/data \\
+            /opt/mongodb-7.0.30/scripts/init-config.sh
+
+          # Start (foreground, add & for background)
+          /opt/mongodb-7.0.30/scripts/start-mongod.sh
+
+          # Connect
+          /opt/mongodb-7.0.30/scripts/mongo-shell.sh
+
+          # Status
+          /opt/mongodb-7.0.30/scripts/status-mongod.sh
+
+          # Stop
+          /opt/mongodb-7.0.30/scripts/stop-mongod.sh
+          \`\`\`
+
+          ### Start as background service (example with systemd)
+
+          \`\`\`ini
+          # /etc/systemd/system/mongod-7.0.service
+          [Unit]
+          Description=MongoDB 7.0
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=mongodb
+          ExecStart=/opt/mongodb-7.0.30/scripts/start-mongod.sh
+          Restart=on-failure
+          LimitNOFILE=64000
+
+          [Install]
+          WantedBy=multi-user.target
+          \`\`\`
+
+          ---
+
+          ### Directory structure
+
+          \`\`\`
+          /opt/mongodb-<version>/
+          ├── bin/
+          │   ├── mongod             # MongoDB server
+          │   ├── mongos             # MongoDB router (sharding)
+          │   ├── mongosh            # MongoDB shell (6.0+)
+          │   ├── mongo              # Legacy shell (< 6.0)
+          │   └── install_compass    # (optional)
+          ├── etc/
+          │   └── mongod.conf.default   # config template
+          ├── data/                  # database files (after init)
+          ├── logs/                  # mongod.log
+          ├── run/                   # mongod.pid
+          ├── tmp/                   # temp files
+          └── scripts/
+              ├── init-config.sh     # generate mongod.conf from template
+              ├── start-mongod.sh    # start mongod with config
+              ├── stop-mongod.sh     # graceful shutdown
+              ├── status-mongod.sh   # check running status
+              └── mongo-shell.sh     # connect via mongosh or mongo
+          \`\`\`
+
+          ---
+
+          ### Verify download
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+          \`\`\`
+          NOTES
+
+      # ----------------------------------------------------------------
+      # 删除已存在的同名 release（避免重复推送冲突）
+      # nightly-* 每日覆盖，build-*/dev-* 也统一先删后建
+      # ----------------------------------------------------------------
+      - name: Delete existing release if exists
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          echo "Checking for existing release: ${TAG}"
+          if gh release view "${TAG}" &>/dev/null; then
+            echo "Existing release found, deleting..."
+            gh release delete "${TAG}" --yes --cleanup-tag
+            echo "Deleted release and tag: ${TAG}"
+            # 等待 GitHub API 同步
+            sleep 5
+          else
+            echo "No existing release found, proceeding..."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.prepare.outputs.release_tag }}
+          name:        "MongoDB Cache ${{ needs.prepare.outputs.release_tag }}"
+          body_path:   release-notes.md
+          draft:       false
+          prerelease:  ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/*.json
+            release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Job 4: 汇总
+  # ============================================================
+  summary:
+    name: Build Summary
+    needs: [prepare, repack, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
+          ## MongoDB Cache Summary
+          SUMMARY
+
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+
+          | Item | Value |
+          |------|-------|
+          | Trigger | ${{ github.event_name }} |
+          | Release Tag | ${{ needs.prepare.outputs.release_tag }} |
+          | Should Release | ${{ needs.prepare.outputs.should_release }} |
+          | Repack Result | ${{ needs.repack.result }} |
+          | Release Result | ${{ needs.release.result }} |
+
+          | Version | Full | OS | amd64 | arm64 | Source |
+          |---------|------|----|-------|-------|--------|
+          | 4.4 | 4.4.30 | debian10 | ✅ | ✅ | official prebuilt |
+          | 5.0 | 5.0.32 | debian11 | ✅ | ✅ | official prebuilt |
+          | 6.0 | 6.0.27 | debian11 | ✅ | ✅ | official prebuilt |
+          | 7.0 | 7.0.30 | debian12 | ✅ | ✅ | official prebuilt |
+          | 8.2 | 8.2.6  | debian12 | ✅ | ✅ | official prebuilt |
+          SUMMARY
