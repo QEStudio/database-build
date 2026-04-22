@@ -1,0 +1,823 @@
+name: Build Redis Multi-Version
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/build-redis.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-redis.yml'
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      redis_versions:
+        description: 'Redis versions (comma-separated: 6.2,7.0,7.4,8.0,8.2,8.4,8.6)'
+        required: false
+        default: '6.2,7.0,7.4,8.0,8.2,8.4,8.6'
+      architectures:
+        description: 'Architectures (comma-separated: amd64,arm64)'
+        required: false
+        default: 'amd64,arm64'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Job 1: 查询各版本最新 release
+  # ============================================================
+  resolve:
+    name: Resolve Redis Versions
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:          ${{ steps.resolve.outputs.matrix }}
+      matrix_download: ${{ steps.resolve.outputs.matrix_download }}
+      release_tag:     ${{ steps.resolve.outputs.release_tag }}
+      should_release:  ${{ steps.resolve.outputs.should_release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve latest versions and build matrix
+        id: resolve
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, urllib.request, urllib.error
+          from datetime import datetime, timezone, timedelta
+
+          CST = timezone(timedelta(hours=8))
+          now_cst = datetime.now(CST)
+          date_tag = now_cst.strftime('%Y%m%d')
+
+          FIXED = {
+            '6.2': {
+              'version':      '6.2',
+              'full_version': '6.2.14',
+              'tarball':      'redis-6.2.14.tar.gz',
+              'url':          'https://download.redis.io/releases/redis-6.2.14.tar.gz',
+            },
+            '7.0': {
+              'version':      '7.0',
+              'full_version': '7.0.15',
+              'tarball':      'redis-7.0.15.tar.gz',
+              'url':          'https://download.redis.io/releases/redis-7.0.15.tar.gz',
+            },
+          }
+
+          DYNAMIC_SERIES = ['7.4', '8.0', '8.2', '8.4', '8.6']
+
+          def fetch_latest(series):
+            url = 'https://download.redis.io/releases/'
+            try:
+              req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode('utf-8', errors='replace')
+            except Exception as e:
+              print(f'WARNING: failed to fetch index: {e}')
+              return None
+            pattern = rf'redis-({re.escape(series)}\.\d+)\.tar\.gz'
+            matches = re.findall(pattern, html)
+            if not matches:
+              return None
+            def ver_key(v):
+              return tuple(int(x) for x in v.split('.'))
+            return max(matches, key=ver_key)
+
+          req_versions = os.environ.get('INPUT_VERSIONS', '6.2,7.0,7.4,8.0,8.2,8.4,8.6').split(',')
+          req_versions = [v.strip() for v in req_versions if v.strip()]
+          req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
+          req_arches   = [a.strip() for a in req_arches if a.strip()]
+
+          ALL_VERSIONS = dict(FIXED)
+
+          for series in DYNAMIC_SERIES:
+            if series not in req_versions:
+              continue
+            print(f'Resolving latest for series {series}...')
+            full = fetch_latest(series)
+            if full is None:
+              print(f'WARNING: could not resolve {series}, skipping')
+              continue
+            tarball = f'redis-{full}.tar.gz'
+            ALL_VERSIONS[series] = {
+              'version':      series,
+              'full_version': full,
+              'tarball':      tarball,
+              'url':          f'https://download.redis.io/releases/{tarball}',
+            }
+            print(f'  {series} -> {full}')
+
+          build_include    = []
+          download_include = []
+          seen_versions    = set()
+
+          for ver in req_versions:
+            if ver not in ALL_VERSIONS:
+              print(f'WARNING: version {ver} not resolved, skip')
+              continue
+            cfg = ALL_VERSIONS[ver]
+
+            if cfg['full_version'] not in seen_versions:
+              seen_versions.add(cfg['full_version'])
+              download_include.append({
+                'full_version': cfg['full_version'],
+                'tarball':      cfg['tarball'],
+                'url':          cfg['url'],
+              })
+
+            for arch in req_arches:
+              entry = dict(cfg)
+              entry['arch']     = arch
+              entry['platform'] = f'linux/{arch}'
+              build_include.append(entry)
+
+          event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
+          ref     = os.environ.get('GITHUB_REF', '')
+          run_num = os.environ.get('GITHUB_RUN_NUMBER', '0')
+
+          if event == 'push' and ref.startswith('refs/tags/'):
+            release_tag    = ref.replace('refs/tags/', '')
+            should_release = 'true'
+          elif event == 'schedule':
+            release_tag    = f'nightly-{date_tag}'
+            should_release = 'true'
+          elif event in ('push', 'workflow_dispatch') and \
+               ref in ('refs/heads/main', 'refs/heads/master'):
+            release_tag    = f'build-{date_tag}-{run_num}'
+            should_release = 'true'
+          else:
+            release_tag    = f'dev-{date_tag}'
+            should_release = 'false'
+
+          matrix          = json.dumps({'include': build_include})
+          matrix_download = json.dumps({'include': download_include})
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'matrix={matrix}\n')
+            f.write(f'matrix_download={matrix_download}\n')
+            f.write(f'release_tag={release_tag}\n')
+            f.write(f'should_release={should_release}\n')
+
+          print(f'\nDownload matrix ({len(download_include)} jobs):')
+          for e in download_include:
+            print(f"  Redis {e['full_version']}")
+          print(f'\nBuild matrix ({len(build_include)} jobs):')
+          for e in build_include:
+            print(f"  Redis {e['full_version']} / {e['arch']}")
+          print(f'Release tag: {release_tag}')
+          print(f'Should release: {should_release}')
+          PYEOF
+        env:
+          INPUT_VERSIONS:    ${{ github.event.inputs.redis_versions || '6.2,7.0,7.4,8.0,8.2,8.4,8.6' }}
+          INPUT_ARCHES:      ${{ github.event.inputs.architectures  || 'amd64,arm64' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF:        ${{ github.ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+  # ============================================================
+  # Job 2: 下载源码
+  # ============================================================
+  download:
+    name: Download Redis ${{ matrix.full_version }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix_download) }}
+      fail-fast: false
+
+    steps:
+      - name: Restore source cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: src/${{ matrix.tarball }}
+          key: redis-src-${{ matrix.full_version }}
+
+      - name: Download source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p src
+          echo "Downloading Redis ${{ matrix.full_version }} from ${{ matrix.url }}"
+          for attempt in 1 2 3 4 5; do
+            if curl -fSL \
+                --retry 3 --retry-delay 15 \
+                --connect-timeout 30 --max-time 600 \
+                -o "src/${{ matrix.tarball }}" \
+                "${{ matrix.url }}"; then
+              echo "Downloaded on attempt ${attempt}"
+              break
+            fi
+            echo "Attempt ${attempt} failed, waiting 20s..."
+            sleep 20
+            if [[ ${attempt} -eq 5 ]]; then
+              echo "::error::Download failed after 5 attempts"
+              exit 1
+            fi
+          done
+
+      - name: Integrity check
+        run: |
+          FILE="src/${{ matrix.tarball }}"
+          SIZE=$(stat -c%s "${FILE}")
+          echo "File: ${FILE}, Size: $(numfmt --to=iec ${SIZE})"
+          if [[ ${SIZE} -lt 1048576 ]]; then
+            echo "::error::File too small (${SIZE} bytes)"
+            exit 1
+          fi
+          file "${FILE}" | grep -qE 'gzip|tar' || {
+            echo "::error::Not a valid tar.gz"
+            exit 1
+          }
+          echo "Integrity check passed"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: src-redis-${{ matrix.full_version }}
+          path: src/${{ matrix.tarball }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ============================================================
+  # Job 3: 编译
+  # ============================================================
+  build:
+    name: "Redis ${{ matrix.full_version }} / ${{ matrix.arch }}"
+    needs: [resolve, download]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: src-redis-${{ matrix.full_version }}
+          path: src/
+
+      - name: Write build script
+        run: |
+          mkdir -p scripts
+          cat > scripts/do-build.sh << 'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+
+          REDIS_VERSION="${REDIS_VERSION}"
+          FULL_VERSION="${FULL_VERSION}"
+          TARBALL="${TARBALL}"
+          ARCH="${TARGET_ARCH}"
+          INSTALL_PREFIX="/opt/redis-${FULL_VERSION}"
+          SRC_DIR="redis-${FULL_VERSION}"
+          BUILD_ROOT="/build"
+          LOG_DIR="/output/logs"
+
+          mkdir -p "${LOG_DIR}" "${BUILD_ROOT}"
+
+          echo "========================================"
+          echo "Redis ${FULL_VERSION} / ${ARCH}"
+          echo "OS:     $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
+          echo "Cores:  $(nproc)"
+          echo "Memory: $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) MB"
+          echo "========================================"
+
+          # ----------------------------------------------------------------
+          # 安装依赖
+          # ----------------------------------------------------------------
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq 2>&1 | tee "${LOG_DIR}/apt.log"
+
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            ca-certificates \
+            file \
+            gzip \
+            procps \
+            patchelf \
+            libssl-dev \
+            libsystemd-dev \
+            tcl \
+            2>&1 | tee -a "${LOG_DIR}/apt.log"
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          # ----------------------------------------------------------------
+          # 解压
+          # ----------------------------------------------------------------
+          mkdir -p "${BUILD_ROOT}/src"
+          cd "${BUILD_ROOT}/src"
+          echo "Extracting ${TARBALL}..."
+          tar -xzf "/src/${TARBALL}"
+          [[ -d "${SRC_DIR}" ]] || {
+            echo "ERROR: ${SRC_DIR} not found after extraction"
+            ls -la
+            exit 1
+          }
+          cd "${SRC_DIR}"
+
+          # ----------------------------------------------------------------
+          # 编译（单条 make，让 Redis Makefile 自动先构建 deps）
+          # 关键修复：不再单独 make -C deps，避免跨架构时 liblua.a 等
+          # 因宿主机/容器架构不一致导致链接失败
+          # ----------------------------------------------------------------
+          NPROC=$(nproc)
+          MALLOC_IMPL="libc"
+
+          echo "--- Building Redis ${FULL_VERSION} (deps + main in one pass) ---"
+          # 先清理，确保没有残留的跨架构产物
+          make distclean 2>/dev/null || true
+
+          make -j"${NPROC}" \
+            BUILD_TLS=yes \
+            USE_SYSTEMD=yes \
+            MALLOC="${MALLOC_IMPL}" \
+            PREFIX="${INSTALL_PREFIX}" \
+            2>&1 | tee "${LOG_DIR}/build.log"
+
+          echo "--- Installing to ${INSTALL_PREFIX} ---"
+          make install \
+            BUILD_TLS=yes \
+            USE_SYSTEMD=yes \
+            MALLOC="${MALLOC_IMPL}" \
+            PREFIX="${INSTALL_PREFIX}" \
+            2>&1 | tee "${LOG_DIR}/install.log"
+
+          # ----------------------------------------------------------------
+          # 创建目录结构
+          # ----------------------------------------------------------------
+          mkdir -p \
+            "${INSTALL_PREFIX}/etc" \
+            "${INSTALL_PREFIX}/data" \
+            "${INSTALL_PREFIX}/logs" \
+            "${INSTALL_PREFIX}/run" \
+            "${INSTALL_PREFIX}/lib/private"
+
+          cp redis.conf "${INSTALL_PREFIX}/etc/redis.conf.default"
+
+          # ----------------------------------------------------------------
+          # 打包依赖库（glibc 族排除）
+          # ----------------------------------------------------------------
+          PRIVATE_LIB="${INSTALL_PREFIX}/lib/private"
+
+          GLIBC_PATTERN="^(libc|libm|libdl|libpthread|librt|libnsl|libresolv|libutil|libcrypt|libgcc_s|ld-linux|ld-musl)[\.-]"
+
+          is_glibc_lib() {
+            basename "$1" | grep -qE "${GLIBC_PATTERN}"
+          }
+
+          declare -A visited
+
+          copy_lib() {
+            local lib="$1"
+            local real
+            real=$(readlink -f "${lib}" 2>/dev/null || echo "${lib}")
+            local bname
+            bname=$(basename "${real}")
+            is_glibc_lib "${bname}" && return 0
+            [[ -n "${visited[${bname}]+_}" ]] && return 0
+            visited["${bname}"]=1
+            if [[ ! -f "${PRIVATE_LIB}/${bname}" ]]; then
+              echo "  copy: ${bname}"
+              cp -L "${real}" "${PRIVATE_LIB}/${bname}"
+              chmod 755 "${PRIVATE_LIB}/${bname}"
+            fi
+            for dep in $(ldd "${real}" 2>/dev/null | awk '/=>/{print $3}' | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          }
+
+          echo "--- Collecting runtime dependencies ---"
+          for binary in "${INSTALL_PREFIX}/bin/redis-server" \
+                        "${INSTALL_PREFIX}/bin/redis-cli"; do
+            [[ -f "${binary}" ]] || continue
+            echo "Scanning: $(basename ${binary})"
+            for dep in $(ldd "${binary}" 2>/dev/null | awk '/=>/{print $3}' | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          done
+
+          echo "Collected $(ls "${PRIVATE_LIB}" | wc -l) libraries:"
+          ls -lh "${PRIVATE_LIB}"
+
+          # ----------------------------------------------------------------
+          # patchelf 修正 RPATH
+          # ----------------------------------------------------------------
+          echo "--- Patching RPATH ---"
+          for binary in "${INSTALL_PREFIX}/bin/"*; do
+            file "${binary}" | grep -qE 'ELF' || continue
+            echo "  patchelf: $(basename ${binary})"
+            patchelf --set-rpath "\$ORIGIN/../lib/private" "${binary}" 2>/dev/null || \
+              echo "  WARNING: patchelf failed for $(basename ${binary})"
+          done
+
+          for sofile in "${PRIVATE_LIB}/"*.so*; do
+            [[ -f "${sofile}" ]] || continue
+            patchelf --set-rpath "\$ORIGIN" "${sofile}" 2>/dev/null || true
+          done
+
+          # ----------------------------------------------------------------
+          # wrapper 脚本
+          # ----------------------------------------------------------------
+          echo "--- Generating wrapper scripts ---"
+
+          make_wrapper() {
+            local cmd="$1"
+            local real_bin="${INSTALL_PREFIX}/bin/${cmd}"
+            [[ -f "${real_bin}" ]] || return 0
+            mv "${real_bin}" "${real_bin}.bin"
+            cat > "${real_bin}" << WRAPPER
+          #!/bin/bash
+          SELF_DIR="\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)"
+          PRIVATE_LIB="\${SELF_DIR}/../lib/private"
+          if [ -d "\${PRIVATE_LIB}" ]; then
+            export LD_LIBRARY_PATH="\${PRIVATE_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+          fi
+          exec "\${SELF_DIR}/${cmd}.bin" "\$@"
+          WRAPPER
+            chmod +x "${real_bin}"
+            echo "  wrapper: ${cmd}"
+          }
+
+          for cmd in redis-server redis-cli redis-benchmark \
+                     redis-check-aof redis-check-rdb redis-sentinel; do
+            make_wrapper "${cmd}"
+          done
+
+          # redis-sentinel 在某些版本是 redis-server 的软链
+          SENTINEL="${INSTALL_PREFIX}/bin/redis-sentinel"
+          if [[ -L "${SENTINEL}" ]]; then
+            rm -f "${SENTINEL}"
+            cat > "${SENTINEL}" << WRAPPER
+          #!/bin/bash
+          SELF_DIR="\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)"
+          PRIVATE_LIB="\${SELF_DIR}/../lib/private"
+          if [ -d "\${PRIVATE_LIB}" ]; then
+            export LD_LIBRARY_PATH="\${PRIVATE_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+          fi
+          exec "\${SELF_DIR}/redis-server.bin" "\$0" "\$@"
+          WRAPPER
+            chmod +x "${SENTINEL}"
+            echo "  wrapper: redis-sentinel (symlink replaced)"
+          fi
+
+          # ----------------------------------------------------------------
+          # 管理脚本
+          # ----------------------------------------------------------------
+          mkdir -p "${INSTALL_PREFIX}/scripts"
+
+          cat > "${INSTALL_PREFIX}/scripts/start-redis.sh" << 'STARTSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/redis.conf}"
+          PORT="${PORT:-6379}"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          LOGFILE="${LOGFILE:-${BASEDIR}/logs/redis.log}"
+          PIDFILE="${PIDFILE:-${BASEDIR}/run/redis.pid}"
+
+          mkdir -p "$(dirname "${LOGFILE}")" "$(dirname "${PIDFILE}")" "${DATADIR}"
+
+          if [ ! -f "${CONFIG}" ]; then
+            cp "${BASEDIR}/etc/redis.conf.default" "${CONFIG}"
+            sed -i "s|^dir .*|dir ${DATADIR}|"            "${CONFIG}"
+            sed -i "s|^logfile .*|logfile ${LOGFILE}|"    "${CONFIG}"
+            sed -i "s|^pidfile .*|pidfile ${PIDFILE}|"    "${CONFIG}"
+            sed -i "s|^port .*|port ${PORT}|"             "${CONFIG}"
+            sed -i "s|^bind .*|bind 127.0.0.1 -::1|"     "${CONFIG}"
+            sed -i "s|^daemonize .*|daemonize yes|"       "${CONFIG}"
+            echo "Generated config: ${CONFIG}"
+          fi
+
+          exec "${BASEDIR}/bin/redis-server" "${CONFIG}" "$@"
+          STARTSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/stop-redis.sh" << 'STOPSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-6379}"
+          "${BASEDIR}/bin/redis-cli" -p "${PORT}" shutdown nosave 2>/dev/null || \
+            echo "Redis may not be running on port ${PORT}"
+          STOPSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/redis-cli.sh" << 'CLISCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-6379}"
+          exec "${BASEDIR}/bin/redis-cli" -p "${PORT}" "$@"
+          CLISCRIPT
+
+          chmod +x "${INSTALL_PREFIX}/scripts/"*.sh
+
+          # ----------------------------------------------------------------
+          # 验证
+          # ----------------------------------------------------------------
+          echo "--- Binary check ---"
+          FAIL=0
+          for bin in redis-server redis-cli redis-benchmark; do
+            BIN_PATH="${INSTALL_PREFIX}/bin/${bin}.bin"
+            if [[ -f "${BIN_PATH}" ]]; then
+              echo "  OK  ${bin}"
+              MISSING=$(ldd "${BIN_PATH}" 2>/dev/null | grep 'not found' || true)
+              if [[ -n "${MISSING}" ]]; then
+                echo "  WARNING: unresolved deps:"
+                echo "${MISSING}"
+              fi
+              objdump -p "${BIN_PATH}" 2>/dev/null \
+                | grep -o 'GLIBC_[0-9.]*' \
+                | sort -V | tail -1 \
+                | xargs -I{} echo "    min glibc: {}" || true
+            else
+              echo "  MISSING ${bin}.bin"
+              FAIL=1
+            fi
+          done
+          [[ "${FAIL}" == "0" ]] || { echo "ERROR: required binaries missing"; exit 1; }
+
+          echo "--- Version ---"
+          "${INSTALL_PREFIX}/bin/redis-server" --version
+          "${INSTALL_PREFIX}/bin/redis-cli"    --version
+
+          # ----------------------------------------------------------------
+          # 打包
+          # ----------------------------------------------------------------
+          PKG_NAME="redis-${FULL_VERSION}-debian12-${ARCH}"
+          cd /opt
+          tar -czf "/output/${PKG_NAME}.tar.gz" "redis-${FULL_VERSION}/"
+
+          cd /output
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          SHA256=$(sha256sum "${PKG_NAME}.tar.gz" | cut -d' ' -f1)
+          BUILD_GLIBC=$(ldd --version 2>/dev/null | head -1 | grep -o '[0-9][0-9.]*$' || echo 'unknown')
+
+          cat > "${PKG_NAME}.json" << JSON
+          {
+            "redis_version":  "${FULL_VERSION}",
+            "major_version":  "${REDIS_VERSION}",
+            "arch":           "${ARCH}",
+            "os":             "linux",
+            "min_glibc":      "${BUILD_GLIBC}",
+            "install_prefix": "${INSTALL_PREFIX}",
+            "bundled_libs":   true,
+            "tls":            true,
+            "package":        "${PKG_NAME}.tar.gz",
+            "sha256":         "${SHA256}",
+            "build_date":     "${BUILD_DATE}",
+            "build_commit":   "${GIT_COMMIT:-unknown}",
+            "build_run":      "${BUILD_RUN:-0}"
+          }
+          JSON
+
+          echo "Package ready:"
+          ls -lh /output/*.tar.gz
+          SCRIPT
+
+          chmod +x scripts/do-build.sh
+
+      - name: Build inside Debian 12 container
+        run: |
+          mkdir -p output
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -v "${{ github.workspace }}/src:/src:ro" \
+            -v "${{ github.workspace }}/scripts:/scripts:ro" \
+            -v "${{ github.workspace }}/output:/output" \
+            -e REDIS_VERSION="${{ matrix.version }}" \
+            -e FULL_VERSION="${{ matrix.full_version }}" \
+            -e TARBALL="${{ matrix.tarball }}" \
+            -e TARGET_ARCH="${{ matrix.arch }}" \
+            -e GIT_COMMIT="${{ github.sha }}" \
+            -e BUILD_RUN="${{ github.run_number }}" \
+            debian:12 \
+            bash /scripts/do-build.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-${{ matrix.full_version }}-debian12-${{ matrix.arch }}
+          path: output/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-redis-${{ matrix.full_version }}-debian12-${{ matrix.arch }}
+          path: output/*.sha256
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-redis-${{ matrix.full_version }}-debian12-${{ matrix.arch }}
+          path: output/*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-redis-${{ matrix.full_version }}-${{ matrix.arch }}
+          path: output/logs/
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 4: 发布
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    if: needs.resolve.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download tar.gz artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: redis-*-debian12-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download sha256 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sha256-redis-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download json artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: json-redis-*
+          path: release/
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          cd release
+          ls -lhR
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          DATE_CN=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
+          REPO="${{ github.repository }}"
+          COMMIT="${{ github.sha }}"
+
+          cat > release-notes.md << NOTES
+          ## Redis Multi-Version Build - ${TAG}
+
+          | Item | Value |
+          |------|-------|
+          | Build time | ${DATE_CN} |
+          | Trigger | ${{ github.event_name }} |
+          | Commit | ${COMMIT:0:8} |
+          | Run | #${{ github.run_number }} |
+
+          ### Packages
+
+          All packages include bundled runtime libraries.
+          Minimum requirement: Linux kernel >= 3.10, glibc >= 2.31.
+          Built with TLS support (BUILD_TLS=yes) and systemd support (USE_SYSTEMD=yes).
+
+          | Series | Version | amd64 | arm64 |
+          |--------|---------|-------|-------|
+          | 6.2 | 6.2.14 (fixed) | ✅ | ✅ |
+          | 7.0 | 7.0.15 (fixed) | ✅ | ✅ |
+          | 7.4 | latest | ✅ | ✅ |
+          | 8.0 | latest | ✅ | ✅ |
+          | 8.2 | latest | ✅ | ✅ |
+          | 8.4 | latest | ✅ | ✅ |
+          | 8.6 | latest | ✅ | ✅ |
+
+          ### Install
+
+          \`\`\`bash
+          ASSET="redis-8.0.6-debian12-amd64.tar.gz"
+          wget https://github.com/${REPO}/releases/download/${TAG}/\${ASSET}
+          wget https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+
+          sudo tar -xzf \${ASSET} -C /opt/
+
+          PORT=6379 /opt/redis-8.0.6/scripts/start-redis.sh
+          /opt/redis-8.0.6/scripts/redis-cli.sh ping
+          /opt/redis-8.0.6/scripts/stop-redis.sh
+          \`\`\`
+
+          ### Directory structure
+
+          \`\`\`
+          /opt/redis-<version>/
+          ├── bin/
+          │   ├── redis-server          # wrapper script
+          │   ├── redis-server.bin      # real binary
+          │   ├── redis-cli
+          │   ├── redis-cli.bin
+          │   ├── redis-benchmark
+          │   ├── redis-benchmark.bin
+          │   └── redis-sentinel
+          ├── lib/private/              # bundled .so files
+          ├── etc/
+          │   └── redis.conf.default
+          ├── data/
+          ├── logs/
+          ├── run/
+          └── scripts/
+              ├── start-redis.sh
+              ├── stop-redis.sh
+              └── redis-cli.sh
+          \`\`\`
+          NOTES
+
+      - name: Delete existing nightly release
+        if: startsWith(needs.resolve.outputs.release_tag, 'nightly-')
+        run: |
+          gh release delete "${{ needs.resolve.outputs.release_tag }}" \
+            --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.resolve.outputs.release_tag }}
+          name:        "Redis Build ${{ needs.resolve.outputs.release_tag }}"
+          body_path:   release-notes.md
+          draft:       false
+          prerelease:  ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/*.json
+            release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Job 5: 汇总
+  # ============================================================
+  summary:
+    name: Build Summary
+    needs: [resolve, build, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
+          ## Redis Build Summary
+          SUMMARY
+
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+
+          | Item | Value |
+          |------|-------|
+          | Trigger | ${{ github.event_name }} |
+          | Release Tag | ${{ needs.resolve.outputs.release_tag }} |
+          | Should Release | ${{ needs.resolve.outputs.should_release }} |
+          | Build Result | ${{ needs.build.result }} |
+          | Release Result | ${{ needs.release.result }} |
+
+          | Series | Version type | Build OS | TLS | Bundled Libs |
+          |--------|-------------|---------|-----|--------------|
+          | 6.2 | fixed 6.2.14 | debian:12 | yes | yes |
+          | 7.0 | fixed 7.0.15 | debian:12 | yes | yes |
+          | 7.4 | latest | debian:12 | yes | yes |
+          | 8.0 | latest | debian:12 | yes | yes |
+          | 8.2 | latest | debian:12 | yes | yes |
+          | 8.4 | latest | debian:12 | yes | yes |
+          | 8.6 | latest | debian:12 | yes | yes |
+          SUMMARY
