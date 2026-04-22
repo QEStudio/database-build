@@ -1,0 +1,1012 @@
+name: Build MongoDB Multi-Version from Source
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/build-mongodb.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-mongodb.yml'
+  schedule:
+    - cron: '0 17 * * 0'   # 每周日 UTC 17:00 (CST 次日 01:00)
+  workflow_dispatch:
+    inputs:
+      mongo_versions:
+        description: 'MongoDB versions (comma-separated: 4.4,5.0,6.0,7.0,8.0,8.2)'
+        required: false
+        default: '7.0,8.0,8.2'
+      architectures:
+        description: 'Architectures (comma-separated: amd64,arm64)'
+        required: false
+        default: 'amd64,arm64'
+      bazel_targets:
+        description: 'Bazel install target'
+        required: false
+        default: 'install-dist-test'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# ================================================================
+# 全局环境变量
+# ================================================================
+env:
+  BAZEL_CACHE_DIR: ~/.cache/bazel
+  PIP_CACHE_DIR:   ~/.cache/pip
+
+jobs:
+  # ==============================================================
+  # Job 1: 生成构建矩阵
+  # ==============================================================
+  prepare:
+    name: Prepare Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:         ${{ steps.gen.outputs.matrix }}
+      release_tag:    ${{ steps.gen.outputs.release_tag }}
+      should_release: ${{ steps.gen.outputs.should_release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate matrix
+        id: gen
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+
+          CST      = timezone(timedelta(hours=8))
+          date_tag = datetime.now(CST).strftime('%Y%m%d')
+
+          # -------------------------------------------------------
+          # 版本表
+          # source_tag    : GitHub tag (对应 refs/tags/rX.Y.Z)
+          # full_version  : 版本号字符串 (用于命名产物)
+          # python_ver    : 编译该版本所需的 Python 版本
+          # gcc_ver       : 推荐 GCC 版本 (Ubuntu PPA)
+          # clang_ver     : 推荐 Clang 版本 (fallback)
+          # -------------------------------------------------------
+          VERSION_TABLE = {
+            '4.4': {
+              'source_tag':    'r4.4.30',
+              'full_version':  '4.4.30',
+              'python_ver':    '3.10',   # 4.x 需要 python3
+              'gcc_ver':       '11',
+              'clang_ver':     '12',
+              'bazel':         False,    # 4.x 用 scons
+            },
+            '5.0': {
+              'source_tag':    'r5.0.32',
+              'full_version':  '5.0.32',
+              'python_ver':    '3.10',
+              'gcc_ver':       '11',
+              'clang_ver':     '12',
+              'bazel':         False,
+            },
+            '6.0': {
+              'source_tag':    'r6.0.27',
+              'full_version':  '6.0.27',
+              'python_ver':    '3.10',
+              'gcc_ver':       '11',
+              'clang_ver':     '14',
+              'bazel':         False,
+            },
+            '7.0': {
+              'source_tag':    'r7.0.20',
+              'full_version':  '7.0.20',
+              'python_ver':    '3.10',
+              'gcc_ver':       '12',
+              'clang_ver':     '15',
+              'bazel':         False,   # 7.x 开始逐步引入 bazel，但仍可 scons
+            },
+            '8.0': {
+              'source_tag':    'r8.0.10',
+              'full_version':  '8.0.10',
+              'python_ver':    '3.13',
+              'gcc_ver':       '14',
+              'clang_ver':     '19',
+              'bazel':         True,
+            },
+            '8.2': {
+              'source_tag':    'r8.2.6',
+              'full_version':  '8.2.6',
+              'python_ver':    '3.13',
+              'gcc_ver':       '14',
+              'clang_ver':     '19',
+              'bazel':         True,
+            },
+          }
+
+          # -------------------------------------------------------
+          # runner 映射
+          # arm64 用 GitHub 托管的 ubuntu-24.04-arm
+          # -------------------------------------------------------
+          RUNNER_MAP = {
+            'amd64': 'ubuntu-22.04',
+            'arm64': 'ubuntu-22.04-arm',
+          }
+
+          req_versions = os.environ.get('INPUT_VERSIONS', '7.0,8.0,8.2').split(',')
+          req_versions = [v.strip() for v in req_versions if v.strip()]
+          req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
+          req_arches   = [a.strip() for a in req_arches if a.strip()]
+          bazel_target = os.environ.get('INPUT_BAZEL_TARGET', 'install-dist-test').strip()
+
+          include = []
+          for ver in req_versions:
+            if ver not in VERSION_TABLE:
+              print(f'WARNING: unknown version {ver}, skip')
+              continue
+            cfg = VERSION_TABLE[ver]
+            for arch in req_arches:
+              if arch not in RUNNER_MAP:
+                print(f'WARNING: unsupported arch {arch}, skip')
+                continue
+              include.append({
+                'version':       ver,
+                'full_version':  cfg['full_version'],
+                'source_tag':    cfg['source_tag'],
+                'python_ver':    cfg['python_ver'],
+                'gcc_ver':       cfg['gcc_ver'],
+                'clang_ver':     cfg['clang_ver'],
+                'use_bazel':     str(cfg['bazel']).lower(),
+                'build_arch':    arch,
+                'runner':        RUNNER_MAP[arch],
+                'bazel_target':  bazel_target,
+              })
+
+          # -------------------------------------------------------
+          # Release 策略
+          # -------------------------------------------------------
+          event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
+          ref     = os.environ.get('GITHUB_REF', '')
+          run_num = os.environ.get('GITHUB_RUN_NUMBER', '0')
+
+          if event == 'push' and ref.startswith('refs/tags/'):
+            release_tag    = ref.replace('refs/tags/', '')
+            should_release = 'true'
+          elif event == 'schedule':
+            release_tag    = f'nightly-{date_tag}'
+            should_release = 'true'
+          elif event in ('push', 'workflow_dispatch') and \
+               ref in ('refs/heads/main', 'refs/heads/master'):
+            release_tag    = f'build-{date_tag}-{run_num}'
+            should_release = 'true'
+          else:
+            release_tag    = f'dev-{date_tag}'
+            should_release = 'false'
+
+          matrix = json.dumps({'include': include})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'matrix={matrix}\n')
+            f.write(f'release_tag={release_tag}\n')
+            f.write(f'should_release={should_release}\n')
+
+          print(f'Matrix ({len(include)} jobs):')
+          for e in include:
+            print(f"  MongoDB {e['full_version']} / {e['build_arch']} "
+                  f"runner={e['runner']}  bazel={e['use_bazel']}")
+          print(f'Release tag    : {release_tag}')
+          print(f'Should release : {should_release}')
+          PYEOF
+        env:
+          INPUT_VERSIONS:    ${{ github.event.inputs.mongo_versions  || '7.0,8.0,8.2' }}
+          INPUT_ARCHES:      ${{ github.event.inputs.architectures   || 'amd64,arm64' }}
+          INPUT_BAZEL_TARGET: ${{ github.event.inputs.bazel_targets  || 'install-dist-test' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF:        ${{ github.ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+  # ==============================================================
+  # Job 2: 编译（每个版本×架构独立 job）
+  # ==============================================================
+  build:
+    name: "MongoDB ${{ matrix.full_version }} / ${{ matrix.build_arch }}"
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360          # 编译最长 6 小时
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 4
+
+    steps:
+      # ------------------------------------------------------------
+      # 0. 磁盘空间检查 & 清理（编译需要 ≥ 40 GB）
+      # ------------------------------------------------------------
+      - name: Free disk space
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h
+
+          # 删除不需要的大型预装软件
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            "$AGENT_TOOLSDIRECTORY" \
+            /opt/hostedtoolcache \
+            || true
+
+          sudo apt-get clean -qq
+
+          echo "=== Disk after cleanup ==="
+          df -h
+
+      # ------------------------------------------------------------
+      # 1. Checkout（仅获取脚本，源码单独下载）
+      # ------------------------------------------------------------
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 2. 安装系统依赖
+      # ------------------------------------------------------------
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl wget git \
+            libcurl4-openssl-dev \
+            liblzma-dev \
+            xz-utils zlib1g-dev \
+            libssl-dev \
+            pkg-config \
+            ninja-build \
+            ca-certificates \
+            software-properties-common \
+            apt-transport-https \
+            gnupg lsb-release
+
+      # ------------------------------------------------------------
+      # 3. 安装指定版本 GCC / Clang
+      #    旧版本（<=7.0）用 GCC 11/12，新版本用 GCC 14
+      # ------------------------------------------------------------
+      - name: Install compiler
+        run: |
+          GCC_VER="${{ matrix.gcc_ver }}"
+          echo "Installing GCC ${GCC_VER}..."
+
+          if [[ "${GCC_VER}" == "14" ]]; then
+            # GCC 14 需要 ubuntu-toolchain-r PPA
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update -qq
+          fi
+
+          sudo apt-get install -y --no-install-recommends \
+            gcc-${GCC_VER} g++-${GCC_VER}
+
+          # 设为默认
+          sudo update-alternatives --install \
+            /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VER} 100 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-${GCC_VER}
+          sudo update-alternatives --set gcc /usr/bin/gcc-${GCC_VER}
+
+          echo "--- Compiler version ---"
+          gcc --version
+          g++ --version
+
+      # ------------------------------------------------------------
+      # 4. 安装 Python（pyenv 方式，保证版本精确）
+      # ------------------------------------------------------------
+      - name: Setup Python ${{ matrix.python_ver }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_ver }}
+
+      - name: Install Python build dependencies
+        run: |
+          python3 -m pip install --upgrade pip wheel setuptools
+          # MongoDB SCons 构建需要
+          python3 -m pip install \
+            psutil pymongo dnspython \
+            pyyaml cheetah3 \
+            regex mypy \
+            packaging
+
+      # ------------------------------------------------------------
+      # 5. 恢复源码缓存（避免重复下载 ~700MB tarball）
+      # ------------------------------------------------------------
+      - name: Restore source cache
+        id: src-cache
+        uses: actions/cache@v4
+        with:
+          path: mongo-src-${{ matrix.source_tag }}.tar.gz
+          key: mongo-src-${{ matrix.source_tag }}
+
+      # ------------------------------------------------------------
+      # 6. 下载 MongoDB 源码
+      # ------------------------------------------------------------
+      - name: Download MongoDB source
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: |
+          TAG="${{ matrix.source_tag }}"
+          URL="https://github.com/mongodb/mongo/archive/refs/tags/${TAG}.tar.gz"
+          echo "Downloading ${URL} ..."
+
+          for attempt in 1 2 3 4 5; do
+            if curl -fSL \
+                --retry 3 --retry-delay 15 \
+                --connect-timeout 30 --max-time 1800 \
+                -o "mongo-src-${TAG}.tar.gz" \
+                "${URL}"; then
+              echo "Downloaded on attempt ${attempt}"
+              break
+            fi
+            echo "Attempt ${attempt} failed, waiting 30s..."
+            sleep 30
+            if [[ ${attempt} -eq 5 ]]; then
+              echo "::error::Source download failed after 5 attempts"
+              exit 1
+            fi
+          done
+
+          SIZE=$(stat -c%s "mongo-src-${TAG}.tar.gz")
+          echo "Size: $(numfmt --to=iec ${SIZE})"
+          if [[ ${SIZE} -lt 10485760 ]]; then
+            echo "::error::Source tarball too small, download may have failed"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # 7. 解压源码
+      # ------------------------------------------------------------
+      - name: Extract source
+        run: |
+          TAG="${{ matrix.source_tag }}"
+          echo "Extracting mongo-src-${TAG}.tar.gz ..."
+          tar -xzf "mongo-src-${TAG}.tar.gz"
+
+          # GitHub archive 解压后目录名为 mongo-rX.Y.Z (去掉前缀r)
+          # 实际可能是 mongo-rX.Y.Z 或 mongo-X.Y.Z
+          SRC_DIR=$(find . -maxdepth 1 -type d -name 'mongo-*' | head -1)
+          echo "Source dir: ${SRC_DIR}"
+          [[ -n "${SRC_DIR}" ]] || { echo "ERROR: source dir not found"; ls -la; exit 1; }
+          mv "${SRC_DIR}" mongo-src
+
+          echo "=== Disk after extraction ==="
+          df -h
+
+      # ------------------------------------------------------------
+      # 8a. Bazel 构建路径（8.0+）
+      # ------------------------------------------------------------
+      - name: Install Bazel
+        if: matrix.use_bazel == 'true'
+        run: |
+          cd mongo-src
+          python3 buildscripts/install_bazel.py
+          echo "${HOME}/.local/bin" >> $GITHUB_PATH
+
+          echo "--- Bazel version ---"
+          ~/.local/bin/bazel version || bazel version
+
+      # Bazel 远程缓存（可选，需要 GCS bucket 或 BuildBuddy）
+      # 这里用本地磁盘缓存加速增量编译
+      - name: Restore Bazel cache
+        if: matrix.use_bazel == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          # key 包含版本+arch+编译器版本，cache miss 时 fallback 到旧缓存
+          key: bazel-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-${{ hashFiles('mongo-src/WORKSPACE', 'mongo-src/MODULE.bazel', 'mongo-src/.bazelrc') }}
+          restore-keys: |
+            bazel-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-
+            bazel-${{ matrix.full_version }}-${{ matrix.build_arch }}-
+            bazel-${{ matrix.full_version }}-
+
+      - name: Build with Bazel
+        if: matrix.use_bazel == 'true'
+        run: |
+          cd mongo-src
+
+          BAZEL_TARGET="${{ matrix.bazel_target }}"
+          GCC_VER="${{ matrix.gcc_ver }}"
+
+          echo "Building target: ${BAZEL_TARGET}"
+          echo "Compiler: GCC ${GCC_VER}"
+
+          # 写入本地 .bazelrc.local，避免修改仓库文件
+          cat > .bazelrc.local << BAZELRC
+          build --disk_cache=${HOME}/.cache/bazel
+          build --jobs=$(nproc)
+          build --local_ram_resources=HOST_RAM*.85
+          build --local_cpu_resources=HOST_CPUS*.9
+          # 将编译器警告降级（新编译器可能触发新警告）
+          build --//bazel/config:compiler_type=gcc
+          BAZELRC
+
+          # 执行编译
+          export CC=gcc
+          export CXX=g++
+
+          set +e
+          bazel build \
+            --disk_cache="${HOME}/.cache/bazel" \
+            --jobs=$(nproc) \
+            --local_ram_resources=HOST_RAM*.85 \
+            --disable_warnings_as_errors=True \
+            "${BAZEL_TARGET}"
+          BUILD_RC=$?
+          set -e
+
+          if [[ ${BUILD_RC} -ne 0 ]]; then
+            echo "::error::Bazel build failed with exit code ${BUILD_RC}"
+            exit ${BUILD_RC}
+          fi
+
+          echo "--- Build outputs ---"
+          ls -lhR bazel-bin/install/bin/ 2>/dev/null || \
+            find bazel-bin -name 'mongod' -o -name 'mongos' 2>/dev/null | head -20
+
+      # ------------------------------------------------------------
+      # 8b. SCons 构建路径（<=7.0）
+      # ------------------------------------------------------------
+      - name: Install SCons
+        if: matrix.use_bazel == 'false'
+        run: |
+          python3 -m pip install 'scons>=4.4' 'ninja>=1.11'
+
+      - name: Restore SCons cache
+        if: matrix.use_bazel == 'false'
+        uses: actions/cache@v4
+        with:
+          path: |
+            mongo-src/.scons_cache
+            ~/.cache/scons
+          key: scons-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-${{ hashFiles('mongo-src/SConstruct', 'mongo-src/SConscript') }}
+          restore-keys: |
+            scons-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-
+            scons-${{ matrix.full_version }}-${{ matrix.build_arch }}-
+
+      - name: Build with SCons
+        if: matrix.use_bazel == 'false'
+        run: |
+          cd mongo-src
+
+          GCC_VER="${{ matrix.gcc_ver }}"
+          JOBS=$(nproc)
+          CACHE_DIR=".scons_cache"
+          mkdir -p "${CACHE_DIR}"
+
+          echo "Building with SCons, GCC ${GCC_VER}, -j${JOBS}"
+
+          # 检测 SCons 支持的选项（不同版本 MongoDB 参数略有差异）
+          SCONS_ARGS=(
+            CC=gcc-${GCC_VER}
+            CXX=g++-${GCC_VER}
+            -j${JOBS}
+            --cache-dir="${CACHE_DIR}"
+            --cache-size=8192
+            --cache-prune-ratio=0.1
+            --variables-files=
+            MONGO_VERSION="${{ matrix.full_version }}"
+            VERBOSE=0
+          )
+
+          # prefix 安装路径
+          INSTALL_PREFIX="$(pwd)/install"
+          mkdir -p "${INSTALL_PREFIX}"
+
+          # 针对不同主版本调整参数
+          MAJOR="${{ matrix.version }}"
+          case "${MAJOR}" in
+            4.4|5.0)
+              SCONS_ARGS+=(
+                --use-system-mongo-c=off
+                --disable-warnings-as-errors
+                DESTDIR="${INSTALL_PREFIX}"
+                install-core
+              )
+              ;;
+            6.0|7.0)
+              SCONS_ARGS+=(
+                --disable-warnings-as-errors
+                DESTDIR="${INSTALL_PREFIX}"
+                install-dist-test
+              )
+              ;;
+          esac
+
+          set +e
+          python3 $(which scons) "${SCONS_ARGS[@]}"
+          BUILD_RC=$?
+          set -e
+
+          if [[ ${BUILD_RC} -ne 0 ]]; then
+            echo "::error::SCons build failed with exit code ${BUILD_RC}"
+            exit ${BUILD_RC}
+          fi
+
+          echo "--- Install dir ---"
+          find "${INSTALL_PREFIX}" -name 'mongod' -o -name 'mongos' | head -20
+
+      # ------------------------------------------------------------
+      # 9. 收集产物 + 添加管理脚本 + 打包
+      # ------------------------------------------------------------
+      - name: Collect and repack binaries
+        run: |
+          set -euo pipefail
+
+          FULL="${{ matrix.full_version }}"
+          BUILD_ARCH="${{ matrix.build_arch }}"
+          INSTALL_NAME="mongodb-${FULL}"
+          DIST_DIR="dist/${INSTALL_NAME}"
+          OUT_DIR="output"
+
+          mkdir -p "${DIST_DIR}/bin" \
+                   "${DIST_DIR}/data" \
+                   "${DIST_DIR}/logs" \
+                   "${DIST_DIR}/run" \
+                   "${DIST_DIR}/tmp" \
+                   "${DIST_DIR}/etc" \
+                   "${DIST_DIR}/scripts" \
+                   "${OUT_DIR}"
+
+          # ---- 查找编译产物 ----
+          echo "Searching for binaries..."
+          if [[ "${{ matrix.use_bazel }}" == "true" ]]; then
+            BIN_SEARCH_ROOTS=(
+              "mongo-src/bazel-bin/install/bin"
+              "mongo-src/bazel-bin"
+            )
+          else
+            BIN_SEARCH_ROOTS=(
+              "mongo-src/install"
+              "mongo-src/build"
+            )
+          fi
+
+          BINARIES=(mongod mongos mongo mongosh)
+
+          for bin in "${BINARIES[@]}"; do
+            for root in "${BIN_SEARCH_ROOTS[@]}"; do
+              FOUND=$(find "${root}" -type f -name "${bin}" 2>/dev/null | head -1)
+              if [[ -n "${FOUND}" ]]; then
+                cp -v "${FOUND}" "${DIST_DIR}/bin/${bin}"
+                chmod +x "${DIST_DIR}/bin/${bin}"
+                echo "  Copied: ${bin} <- ${FOUND}"
+                break
+              fi
+            done
+          done
+
+          # mongod 必须存在
+          [[ -f "${DIST_DIR}/bin/mongod" ]] || {
+            echo "::error::mongod binary not found!"
+            find mongo-src -name 'mongod' 2>/dev/null || true
+            exit 1
+          }
+
+          echo "--- Binary check ---"
+          ls -lh "${DIST_DIR}/bin/"
+          "${DIST_DIR}/bin/mongod" --version
+          ldd "${DIST_DIR}/bin/mongod" || true
+
+          # ---- 生成配置模板 ----
+          cat > "${DIST_DIR}/etc/mongod.conf.default" << 'MONGOCFG'
+          # MongoDB default configuration template
+          # Generated by GH Actions source build
+          systemLog:
+            destination: file
+            path: __BASEDIR__/logs/mongod.log
+            logAppend: true
+            logRotate: reopen
+
+          storage:
+            dbPath: __BASEDIR__/data
+            journal:
+              enabled: true
+
+          net:
+            port: 27017
+            bindIp: 127.0.0.1
+
+          processManagement:
+            fork: false
+            pidFilePath: __BASEDIR__/run/mongod.pid
+
+          # security:
+          #   authorization: enabled
+
+          # replication:
+          #   replSetName: rs0
+          MONGOCFG
+
+          # ---- 管理脚本 ----
+          cat > "${DIST_DIR}/scripts/init-config.sh" << 'INITSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+          PORT="${PORT:-27017}"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          LOGFILE="${LOGFILE:-${BASEDIR}/logs/mongod.log}"
+          PIDFILE="${PIDFILE:-${BASEDIR}/run/mongod.pid}"
+
+          if [[ -f "${CONFIG}" ]]; then
+            echo "Config already exists: ${CONFIG}"
+            echo "Delete it first if you want to reinitialize."
+            exit 0
+          fi
+
+          mkdir -p "${DATADIR}" \
+                   "$(dirname "${LOGFILE}")" \
+                   "$(dirname "${PIDFILE}")" \
+                   "${BASEDIR}/tmp"
+
+          sed \
+            -e "s|__BASEDIR__|${BASEDIR}|g" \
+            "${BASEDIR}/etc/mongod.conf.default" \
+            > "${CONFIG}"
+
+          sed -i "s|^    port: .*|    port: ${PORT}|"               "${CONFIG}"
+          sed -i "s|path: .*logs/mongod.log|path: ${LOGFILE}|"      "${CONFIG}"
+          sed -i "s|dbPath: .*data|dbPath: ${DATADIR}|"             "${CONFIG}"
+          sed -i "s|pidFilePath: .*run/mongod.pid|pidFilePath: ${PIDFILE}|" "${CONFIG}"
+
+          echo "Config  : ${CONFIG}"
+          echo "Data    : ${DATADIR}"
+          echo "Log     : ${LOGFILE}"
+          echo "Port    : ${PORT}"
+          INITSCRIPT
+
+          cat > "${DIST_DIR}/scripts/start-mongod.sh" << 'STARTSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+
+          if [[ ! -f "${CONFIG}" ]]; then
+            echo "Config not found: ${CONFIG}"
+            echo "Run: ${BASEDIR}/scripts/init-config.sh"
+            exit 1
+          fi
+
+          mkdir -p "${BASEDIR}/data" "${BASEDIR}/logs" \
+                   "${BASEDIR}/run"  "${BASEDIR}/tmp"
+
+          exec "${BASEDIR}/bin/mongod" --config "${CONFIG}" "$@"
+          STARTSCRIPT
+
+          cat > "${DIST_DIR}/scripts/stop-mongod.sh" << 'STOPSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-27017}"
+          HOST="${HOST:-127.0.0.1}"
+
+          MONGO_CMD=""
+          for c in "${BASEDIR}/bin/mongosh" "${BASEDIR}/bin/mongo"; do
+            [[ -f "${c}" ]] && { MONGO_CMD="${c}"; break; }
+          done
+
+          if [[ -n "${MONGO_CMD}" ]]; then
+            "${MONGO_CMD}" --host "${HOST}" --port "${PORT}" \
+              --eval 'db.adminCommand({ shutdown: 1, force: true })' \
+              admin 2>/dev/null || true
+          else
+            PID_FILE="${BASEDIR}/run/mongod.pid"
+            if [[ -f "${PID_FILE}" ]]; then
+              PID=$(cat "${PID_FILE}")
+              echo "Sending SIGTERM to PID ${PID}..."
+              kill "${PID}" 2>/dev/null || echo "Process not found"
+            else
+              echo "PID file not found: ${PID_FILE}"
+            fi
+          fi
+          STOPSCRIPT
+
+          cat > "${DIST_DIR}/scripts/status-mongod.sh" << 'STATUSSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PID_FILE="${BASEDIR}/run/mongod.pid"
+          PORT="${PORT:-27017}"
+          if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+            echo "mongod is RUNNING (PID=$(cat "${PID_FILE}"), PORT=${PORT})"
+          else
+            echo "mongod is NOT running"
+          fi
+          STATUSSCRIPT
+
+          cat > "${DIST_DIR}/scripts/mongo-shell.sh" << 'SHELLSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-27017}"
+          HOST="${HOST:-127.0.0.1}"
+          for c in "${BASEDIR}/bin/mongosh" "${BASEDIR}/bin/mongo"; do
+            [[ -f "${c}" ]] && exec "${c}" --host "${HOST}" --port "${PORT}" "$@"
+          done
+          echo "ERROR: neither mongosh nor mongo found in ${BASEDIR}/bin/"
+          exit 1
+          SHELLSCRIPT
+
+          chmod +x "${DIST_DIR}/scripts/"*.sh
+
+          # ---- 生成 BUILD_INFO ----
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          MONGOD_VER=$("${DIST_DIR}/bin/mongod" --version 2>&1 | head -3)
+          cat > "${DIST_DIR}/BUILD_INFO" << INFO
+          MongoDB Source Build
+          ====================
+          Full Version : ${FULL}
+          Architecture : ${BUILD_ARCH}
+          Build Date   : ${BUILD_DATE}
+          GH Run       : ${{ github.run_number }}
+          GH Commit    : ${{ github.sha }}
+          Build System : ${{ matrix.use_bazel == 'true' && 'Bazel' || 'SCons' }}
+          GCC Version  : ${{ matrix.gcc_ver }}
+
+          mongod --version output:
+          ${MONGOD_VER}
+          INFO
+
+          # ---- 打包 ----
+          OS_LABEL="linux"
+          PKG_NAME="mongodb-src-${FULL}-${OS_LABEL}-${BUILD_ARCH}"
+
+          cd dist
+          tar -czf "../${OUT_DIR}/${PKG_NAME}.tar.gz" "${INSTALL_NAME}/"
+          cd ..
+
+          cd "${OUT_DIR}"
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+          SHA256=$(sha256sum "${PKG_NAME}.tar.gz" | cut -d' ' -f1)
+
+          cat > "${PKG_NAME}.json" << JSON
+          {
+            "mongo_version":  "${FULL}",
+            "major_version":  "${{ matrix.version }}",
+            "arch":           "${BUILD_ARCH}",
+            "os":             "linux",
+            "source":         "compiled-from-source",
+            "source_tag":     "${{ matrix.source_tag }}",
+            "package":        "${PKG_NAME}.tar.gz",
+            "sha256":         "${SHA256}",
+            "build_date":     "${BUILD_DATE}",
+            "gcc_version":    "${{ matrix.gcc_ver }}",
+            "build_system":   "${{ matrix.use_bazel == 'true' && 'bazel' || 'scons' }}",
+            "workflow_run":   "${{ github.run_number }}"
+          }
+          JSON
+
+          echo "=== Output ==="
+          ls -lh "../${OUT_DIR}/"
+          echo "=== Disk usage ==="
+          df -h
+
+      # ------------------------------------------------------------
+      # 10. 清理源码目录（节省磁盘，防止 artifact 上传超时）
+      # ------------------------------------------------------------
+      - name: Cleanup build dirs
+        if: always()
+        run: |
+          rm -rf mongo-src dist || true
+          df -h
+
+      # ------------------------------------------------------------
+      # 11. 上传产物
+      # ------------------------------------------------------------
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-src-${{ matrix.full_version }}-linux-${{ matrix.build_arch }}
+          path: output/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-mongodb-src-${{ matrix.full_version }}-linux-${{ matrix.build_arch }}
+          path: output/*.sha256
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-mongodb-src-${{ matrix.full_version }}-linux-${{ matrix.build_arch }}
+          path: output/*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ==============================================================
+  # Job 3: 发布 Release
+  # ==============================================================
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download tar.gz artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mongodb-src-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download sha256 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sha256-mongodb-src-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download json artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: json-mongodb-src-*
+          path: release/
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          cd release
+          echo "=== Release contents ==="
+          ls -lhR
+          echo ""
+          echo "=== SHA256SUMS ==="
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          DATE_CN=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
+          REPO="${{ github.repository }}"
+          COMMIT="${{ github.sha }}"
+
+          cat > release-notes.md << NOTES
+          ## MongoDB Source Build - ${TAG}
+
+          > **Build method**: Compiled from official MongoDB source code.
+          > Supports **amd64** and **arm64** natively.
+
+          | Item | Value |
+          |------|-------|
+          | Build time | ${DATE_CN} |
+          | Trigger | ${{ github.event_name }} |
+          | Commit | \`${COMMIT:0:8}\` |
+          | Run | #${{ github.run_number }} |
+
+          ---
+
+          ### Packages
+
+          | Version | Source Tag | Build System | amd64 | arm64 |
+          |---------|-----------|--------------|-------|-------|
+          | 4.4 | r4.4.30 | SCons | ✅ | ✅ |
+          | 5.0 | r5.0.32 | SCons | ✅ | ✅ |
+          | 6.0 | r6.0.27 | SCons | ✅ | ✅ |
+          | 7.0 | r7.0.20 | SCons | ✅ | ✅ |
+          | 8.0 | r8.0.10 | Bazel | ✅ | ✅ |
+          | 8.2 | r8.2.6  | Bazel | ✅ | ✅ |
+
+          ---
+
+          ### Quick Start
+
+          \`\`\`bash
+          # Example: MongoDB 8.2 on arm64
+          ASSET="mongodb-src-8.2.6-linux-arm64.tar.gz"
+          wget https://github.com/${REPO}/releases/download/${TAG}/\${ASSET}
+
+          # Verify
+          wget https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+
+          # Extract
+          tar -xzf \${ASSET} -C /opt/
+
+          # Init config
+          PORT=27017 /opt/mongodb-8.2.6/scripts/init-config.sh
+
+          # Start
+          /opt/mongodb-8.2.6/scripts/start-mongod.sh
+
+          # Connect
+          /opt/mongodb-8.2.6/scripts/mongo-shell.sh
+
+          # Status / Stop
+          /opt/mongodb-8.2.6/scripts/status-mongod.sh
+          /opt/mongodb-8.2.6/scripts/stop-mongod.sh
+          \`\`\`
+
+          ### Directory layout
+
+          \`\`\`
+          /opt/mongodb-<version>/
+          ├── bin/          # mongod, mongos, mongosh/mongo
+          ├── etc/          # mongod.conf.default
+          ├── scripts/      # init/start/stop/status/shell
+          ├── data/         # (created on init)
+          ├── logs/         # (created on init)
+          ├── run/          # pid file
+          ├── tmp/
+          └── BUILD_INFO    # build metadata
+          \`\`\`
+          NOTES
+
+      - name: Delete existing release if exists
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          if gh release view "${TAG}" &>/dev/null; then
+            echo "Deleting existing release: ${TAG}"
+            gh release delete "${TAG}" --yes --cleanup-tag
+            sleep 5
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.prepare.outputs.release_tag }}
+          name:        "MongoDB Source Build ${{ needs.prepare.outputs.release_tag }}"
+          body_path:   release-notes.md
+          draft:       false
+          prerelease:  ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/*.json
+            release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==============================================================
+  # Job 4: 汇总
+  # ==============================================================
+  summary:
+    name: Build Summary
+    needs: [prepare, build, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
+          ## MongoDB Source Build Summary
+          SUMMARY
+
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+
+          | Item | Value |
+          |------|-------|
+          | Trigger | ${{ github.event_name }} |
+          | Release Tag | ${{ needs.prepare.outputs.release_tag }} |
+          | Should Release | ${{ needs.prepare.outputs.should_release }} |
+          | Build Result | ${{ needs.build.result }} |
+          | Release Result | ${{ needs.release.result }} |
+
+          ### Version Build Matrix
+
+          | Version | Source | Build System | Compiler | amd64 | arm64 |
+          |---------|--------|--------------|----------|-------|-------|
+          | 4.4 | r4.4.30 | SCons | GCC 11 | ✅ | ✅ |
+          | 5.0 | r5.0.32 | SCons | GCC 11 | ✅ | ✅ |
+          | 6.0 | r6.0.27 | SCons | GCC 11 | ✅ | ✅ |
+          | 7.0 | r7.0.20 | SCons | GCC 12 | ✅ | ✅ |
+          | 8.0 | r8.0.10 | Bazel | GCC 14 | ✅ | ✅ |
+          | 8.2 | r8.2.6  | Bazel | GCC 14 | ✅ | ✅ |
+
+          > All builds compiled from official MongoDB source on GitHub native runners.
+          > arm64 uses \`ubuntu-22.04-arm\` hosted runner.
+          SUMMARY
