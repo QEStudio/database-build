@@ -1,0 +1,949 @@
+name: Build PostgreSQL Multi-Version
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/build-postgresql.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-postgresql.yml'
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      pg_versions:
+        description: 'PostgreSQL versions (comma-separated: 14,15,16,17,18)'
+        required: false
+        default: '14,15,16,17,18'
+      architectures:
+        description: 'Architectures (comma-separated: amd64,arm64)'
+        required: false
+        default: 'amd64,arm64'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Job 1: 查询各版本最新 release
+  # ============================================================
+  resolve:
+    name: Resolve PostgreSQL Versions
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:          ${{ steps.resolve.outputs.matrix }}
+      matrix_download: ${{ steps.resolve.outputs.matrix_download }}
+      release_tag:     ${{ steps.resolve.outputs.release_tag }}
+      should_release:  ${{ steps.resolve.outputs.should_release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve latest versions and build matrix
+        id: resolve
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, urllib.request
+          from datetime import datetime, timezone, timedelta
+
+          CST = timezone(timedelta(hours=8))
+          now_cst = datetime.now(CST)
+          date_tag = now_cst.strftime('%Y%m%d')
+
+          ALL_SERIES = ['14', '15', '16', '17', '18']
+
+          def fetch_latest(major):
+            index_url = 'https://ftp.postgresql.org/pub/source/'
+            try:
+              req = urllib.request.Request(
+                index_url,
+                headers={'User-Agent': 'Mozilla/5.0'}
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                html = resp.read().decode('utf-8', errors='replace')
+            except Exception as e:
+              print(f'WARNING: failed to fetch FTP index: {e}')
+              return None
+            pattern = rf'href="v({re.escape(major)}\.\d+)/"'
+            matches = re.findall(pattern, html)
+            if not matches:
+              return None
+            def ver_key(v):
+              return tuple(int(x) for x in v.split('.'))
+            return max(matches, key=ver_key)
+
+          req_versions = os.environ.get('INPUT_VERSIONS', '14,15,16,17,18').split(',')
+          req_versions = [v.strip() for v in req_versions if v.strip()]
+          req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
+          req_arches   = [a.strip() for a in req_arches if a.strip()]
+
+          ALL_VERSIONS = {}
+          for major in ALL_SERIES:
+            if major not in req_versions:
+              continue
+            print(f'Resolving latest for PostgreSQL {major}...')
+            full = fetch_latest(major)
+            if full is None:
+              print(f'WARNING: could not resolve {major}, skipping')
+              continue
+            tarball = f'postgresql-{full}.tar.gz'
+            ALL_VERSIONS[major] = {
+              'version':      major,
+              'full_version': full,
+              'tarball':      tarball,
+              'url':          f'https://ftp.postgresql.org/pub/source/v{full}/{tarball}',
+            }
+            print(f'  {major} -> {full}')
+
+          # 编译矩阵（version × arch）
+          build_include    = []
+          # 下载矩阵（去重，每个 full_version 只出现一次）
+          download_include = []
+          seen_versions    = set()
+
+          for ver in req_versions:
+            if ver not in ALL_VERSIONS:
+              print(f'WARNING: version {ver} not resolved, skip')
+              continue
+            cfg = ALL_VERSIONS[ver]
+
+            if cfg['full_version'] not in seen_versions:
+              seen_versions.add(cfg['full_version'])
+              download_include.append({
+                'full_version': cfg['full_version'],
+                'tarball':      cfg['tarball'],
+                'url':          cfg['url'],
+              })
+
+            for arch in req_arches:
+              entry = dict(cfg)
+              entry['build_arch'] = arch          # 用 build_arch，避免与 Makefile ARCH 冲突
+              entry['platform']   = f'linux/{arch}'
+              build_include.append(entry)
+
+          event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
+          ref     = os.environ.get('GITHUB_REF', '')
+          run_num = os.environ.get('GITHUB_RUN_NUMBER', '0')
+
+          if event == 'push' and ref.startswith('refs/tags/'):
+            release_tag    = ref.replace('refs/tags/', '')
+            should_release = 'true'
+          elif event == 'schedule':
+            release_tag    = f'nightly-{date_tag}'
+            should_release = 'true'
+          elif event in ('push', 'workflow_dispatch') and \
+               ref in ('refs/heads/main', 'refs/heads/master'):
+            release_tag    = f'build-{date_tag}-{run_num}'
+            should_release = 'true'
+          else:
+            release_tag    = f'dev-{date_tag}'
+            should_release = 'false'
+
+          matrix          = json.dumps({'include': build_include})
+          matrix_download = json.dumps({'include': download_include})
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'matrix={matrix}\n')
+            f.write(f'matrix_download={matrix_download}\n')
+            f.write(f'release_tag={release_tag}\n')
+            f.write(f'should_release={should_release}\n')
+
+          print(f'\nDownload matrix ({len(download_include)} jobs):')
+          for e in download_include:
+            print(f"  PostgreSQL {e['full_version']}")
+          print(f'\nBuild matrix ({len(build_include)} jobs):')
+          for e in build_include:
+            print(f"  PostgreSQL {e['full_version']} / {e['build_arch']}")
+          print(f'Release tag: {release_tag}')
+          print(f'Should release: {should_release}')
+          PYEOF
+        env:
+          INPUT_VERSIONS:    ${{ github.event.inputs.pg_versions   || '14,15,16,17,18' }}
+          INPUT_ARCHES:      ${{ github.event.inputs.architectures || 'amd64,arm64' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF:        ${{ github.ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+  # ============================================================
+  # Job 2: 下载源码（每个 full_version 仅一次，已去重）
+  # ============================================================
+  download:
+    name: Download PostgreSQL ${{ matrix.full_version }}
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix_download) }}
+      fail-fast: false
+
+    steps:
+      - name: Restore source cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: src/${{ matrix.tarball }}
+          key: pg-src-${{ matrix.full_version }}
+
+      - name: Download source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p src
+          echo "Downloading PostgreSQL ${{ matrix.full_version }} from ${{ matrix.url }}"
+          for attempt in 1 2 3 4 5; do
+            if curl -fSL \
+                --retry 3 --retry-delay 15 \
+                --connect-timeout 30 --max-time 600 \
+                -o "src/${{ matrix.tarball }}" \
+                "${{ matrix.url }}"; then
+              echo "Downloaded on attempt ${attempt}"
+              break
+            fi
+            echo "Attempt ${attempt} failed, waiting 20s..."
+            sleep 20
+            if [[ ${attempt} -eq 5 ]]; then
+              echo "::error::Download failed after 5 attempts"
+              exit 1
+            fi
+          done
+
+      - name: Integrity check
+        run: |
+          FILE="src/${{ matrix.tarball }}"
+          SIZE=$(stat -c%s "${FILE}")
+          echo "File: ${FILE}, Size: $(numfmt --to=iec ${SIZE})"
+          if [[ ${SIZE} -lt 10485760 ]]; then
+            echo "::error::File too small (${SIZE} bytes)"
+            exit 1
+          fi
+          file "${FILE}" | grep -qE 'gzip|tar' || {
+            echo "::error::Not a valid tar.gz"
+            exit 1
+          }
+          echo "Integrity check passed"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: src-pg-${{ matrix.full_version }}
+          path: src/${{ matrix.tarball }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ============================================================
+  # Job 3: 编译
+  # ============================================================
+  build:
+    name: "PostgreSQL ${{ matrix.full_version }} / ${{ matrix.build_arch }}"
+    needs: [resolve, download]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: src-pg-${{ matrix.full_version }}
+          path: src/
+
+      - name: Write build script
+        run: |
+          mkdir -p scripts
+          # 注意：'SCRIPT' 带引号，heredoc 内容不做变量展开，
+          # 脚本内部变量由 docker run -e 传入后在容器内展开
+          cat > scripts/do-build.sh << 'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+
+          # ------------------------------------------------------------------
+          # 所有变量从 docker run -e 注入，不在此处硬编码
+          # 关键：绝对不能 export ARCH=xxx，会污染 PostgreSQL Makefile 系统
+          # 用 BUILD_ARCH 代替
+          # ------------------------------------------------------------------
+          PG_MAJOR="${PG_MAJOR}"
+          FULL_VERSION="${FULL_VERSION}"
+          TARBALL="${TARBALL}"
+          BUILD_ARCH="${BUILD_ARCH}"        # amd64 / arm64，仅用于命名，不 export 为 ARCH
+          INSTALL_PREFIX="/opt/postgresql-${FULL_VERSION}"
+          SRC_DIR="postgresql-${FULL_VERSION}"
+          BUILD_ROOT="/build"
+          LOG_DIR="/output/logs"
+
+          mkdir -p "${LOG_DIR}" "${BUILD_ROOT}"
+
+          echo "========================================"
+          echo "PostgreSQL ${FULL_VERSION} / ${BUILD_ARCH}"
+          echo "OS:     $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
+          echo "Cores:  $(nproc)"
+          echo "Memory: $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) MB"
+          echo "========================================"
+
+          # 确保 ARCH 未被 export（PostgreSQL Makefile 会读取该变量）
+          unset ARCH
+
+          # ----------------------------------------------------------------
+          # 安装依赖
+          # ----------------------------------------------------------------
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq 2>&1 | tee "${LOG_DIR}/apt.log"
+
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            ca-certificates \
+            file \
+            gzip \
+            procps \
+            patchelf \
+            libssl-dev \
+            libreadline-dev \
+            zlib1g-dev \
+            liblz4-dev \
+            libzstd-dev \
+            libicu-dev \
+            libxml2-dev \
+            libxslt1-dev \
+            libpam-dev \
+            libldap2-dev \
+            libkrb5-dev \
+            libgssapi-krb5-2 \
+            libedit-dev \
+            libsystemd-dev \
+            uuid-dev \
+            python3-dev \
+            perl \
+            libperl-dev \
+            tcl \
+            tcl-dev \
+            bison \
+            flex \
+            2>&1 | tee -a "${LOG_DIR}/apt.log"
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          # ----------------------------------------------------------------
+          # 解压
+          # ----------------------------------------------------------------
+          mkdir -p "${BUILD_ROOT}/src"
+          cd "${BUILD_ROOT}/src"
+          echo "Extracting ${TARBALL}..."
+          tar -xzf "/src/${TARBALL}"
+          [[ -d "${SRC_DIR}" ]] || {
+            echo "ERROR: ${SRC_DIR} not found after extraction"
+            ls -la
+            exit 1
+          }
+          cd "${SRC_DIR}"
+
+          # ----------------------------------------------------------------
+          # configure
+          # 注意：make 时不传任何可能被误解为文件名的变量
+          # ----------------------------------------------------------------
+          NPROC=$(nproc)
+
+          CONFIGURE_ARGS=(
+            --prefix="${INSTALL_PREFIX}"
+            --with-openssl
+            --with-readline
+            --with-zlib
+            --with-icu
+            --with-libxml
+            --with-libxslt
+            --with-pam
+            --with-ldap
+            --with-gssapi
+            --with-uuid=e2fs
+            --with-perl
+            --with-python
+            --with-tcl
+            --with-systemd
+            --enable-debug=no
+          )
+
+          # lz4 支持从 14 开始
+          if [[ "${PG_MAJOR}" -ge 14 ]]; then
+            CONFIGURE_ARGS+=( --with-lz4 )
+          fi
+
+          # zstd 支持从 15 开始
+          if [[ "${PG_MAJOR}" -ge 15 ]]; then
+            CONFIGURE_ARGS+=( --with-zstd )
+          fi
+
+          echo "Running configure with args:"
+          printf '  %s\n' "${CONFIGURE_ARGS[@]}"
+          ./configure "${CONFIGURE_ARGS[@]}" 2>&1 | tee "${LOG_DIR}/configure.log"
+
+          # ----------------------------------------------------------------
+          # 编译 & 安装
+          # 只传 -j 参数，不传任何 VAR=value 到 make，避免变量名污染
+          # ----------------------------------------------------------------
+          echo "Building with ${NPROC} jobs..."
+          make -j"${NPROC}" 2>&1 | tee "${LOG_DIR}/build.log"
+
+          echo "Building contrib modules..."
+          make -j"${NPROC}" -C contrib 2>&1 | tee -a "${LOG_DIR}/build.log"
+
+          echo "Installing..."
+          make install 2>&1 | tee "${LOG_DIR}/install.log"
+
+          echo "Installing contrib modules..."
+          make install -C contrib 2>&1 | tee -a "${LOG_DIR}/install.log"
+
+          # ----------------------------------------------------------------
+          # 创建目录结构
+          # ----------------------------------------------------------------
+          mkdir -p \
+            "${INSTALL_PREFIX}/data" \
+            "${INSTALL_PREFIX}/logs" \
+            "${INSTALL_PREFIX}/run" \
+            "${INSTALL_PREFIX}/etc" \
+            "${INSTALL_PREFIX}/lib/private" \
+            "${INSTALL_PREFIX}/scripts"
+
+          # ----------------------------------------------------------------
+          # 打包依赖库（排除 glibc 族）
+          # ----------------------------------------------------------------
+          PRIVATE_LIB="${INSTALL_PREFIX}/lib/private"
+
+          # glibc 族：不打包，依赖系统提供
+          GLIBC_PATTERN="^(libc|libm|libdl|libpthread|librt|libnsl|libresolv|libutil|libcrypt|libgcc_s|ld-linux|ld-musl)[\.-]"
+
+          is_glibc_lib() {
+            basename "$1" | grep -qE "${GLIBC_PATTERN}"
+          }
+
+          declare -A visited
+
+          copy_lib() {
+            local lib="$1"
+            local real
+            real=$(readlink -f "${lib}" 2>/dev/null || echo "${lib}")
+            local bname
+            bname=$(basename "${real}")
+            is_glibc_lib "${bname}" && return 0
+            [[ -n "${visited[${bname}]+_}" ]] && return 0
+            visited["${bname}"]=1
+            if [[ ! -f "${PRIVATE_LIB}/${bname}" ]]; then
+              echo "  copy: ${bname}"
+              cp -L "${real}" "${PRIVATE_LIB}/${bname}"
+              chmod 755 "${PRIVATE_LIB}/${bname}"
+            fi
+            local dep
+            for dep in $(ldd "${real}" 2>/dev/null \
+                         | awk '/=>/{print $3}' \
+                         | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          }
+
+          echo "--- Collecting runtime dependencies ---"
+
+          # 扫描 bin/ 下所有 ELF 可执行文件
+          while IFS= read -r -d '' binary; do
+            file "${binary}" | grep -qE 'ELF.*executable' || continue
+            echo "Scanning: $(basename ${binary})"
+            for dep in $(ldd "${binary}" 2>/dev/null \
+                         | awk '/=>/{print $3}' \
+                         | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          done < <(find "${INSTALL_PREFIX}/bin" -maxdepth 1 -type f -print0)
+
+          # 扫描 lib/ 下的 .so（含插件）
+          while IFS= read -r -d '' sofile; do
+            for dep in $(ldd "${sofile}" 2>/dev/null \
+                         | awk '/=>/{print $3}' \
+                         | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          done < <(find "${INSTALL_PREFIX}/lib" -name "*.so*" \
+                        -not -path "*/private/*" -type f -print0)
+
+          echo "Collected $(ls "${PRIVATE_LIB}" | wc -l) libraries:"
+          ls -lh "${PRIVATE_LIB}"
+
+          # ----------------------------------------------------------------
+          # patchelf 修正 RPATH
+          # ----------------------------------------------------------------
+          echo "--- Patching RPATH ---"
+
+          # bin/ 可执行文件：优先找 private，然后找 lib（插件目录）
+          while IFS= read -r -d '' f; do
+            file "${f}" | grep -qE 'ELF' || continue
+            echo "  patchelf bin: $(basename ${f})"
+            patchelf --set-rpath "\$ORIGIN/../lib/private:\$ORIGIN/../lib" \
+              "${f}" 2>/dev/null || \
+              echo "  WARNING: patchelf failed for $(basename ${f})"
+          done < <(find "${INSTALL_PREFIX}/bin" -maxdepth 1 -type f -print0)
+
+          # lib/ 下的 .so（插件等）：找 private 和同级 lib/
+          while IFS= read -r -d '' f; do
+            patchelf --set-rpath \
+              "\$ORIGIN/private:\$ORIGIN" \
+              "${f}" 2>/dev/null || true
+          done < <(find "${INSTALL_PREFIX}/lib" -name "*.so*" \
+                        -not -path "*/private/*" -type f -print0)
+
+          # lib/private/ 内互相依赖
+          while IFS= read -r -d '' f; do
+            patchelf --set-rpath "\$ORIGIN" "${f}" 2>/dev/null || true
+          done < <(find "${PRIVATE_LIB}" -name "*.so*" -type f -print0)
+
+          # ----------------------------------------------------------------
+          # wrapper 脚本
+          # ----------------------------------------------------------------
+          echo "--- Generating wrapper scripts ---"
+
+          make_wrapper() {
+            local cmd="$1"
+            local real_bin="${INSTALL_PREFIX}/bin/${cmd}"
+            [[ -f "${real_bin}" ]] || return 0
+            mv "${real_bin}" "${real_bin}.bin"
+            cat > "${real_bin}" << WRAPPER
+          #!/bin/bash
+          SELF_DIR="\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)"
+          PRIVATE_LIB="\${SELF_DIR}/../lib/private"
+          PG_LIB="\${SELF_DIR}/../lib"
+          if [ -d "\${PRIVATE_LIB}" ]; then
+            export LD_LIBRARY_PATH="\${PRIVATE_LIB}:\${PG_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+          fi
+          exec "\${SELF_DIR}/${cmd}.bin" "\$@"
+          WRAPPER
+            chmod +x "${real_bin}"
+            echo "  wrapper: ${cmd}"
+          }
+
+          for cmd in postgres pg_ctl psql pg_dump pg_dumpall pg_restore \
+                     pg_basebackup pg_isready initdb pg_upgrade \
+                     pg_rewind pg_receivewal pg_recvlogical \
+                     pg_verifybackup pgbench; do
+            make_wrapper "${cmd}"
+          done
+
+          # ----------------------------------------------------------------
+          # 管理脚本
+          # ----------------------------------------------------------------
+          cat > "${INSTALL_PREFIX}/scripts/initdb.sh" << 'INITSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          PG_USER="${PG_USER:-$(whoami)}"
+          ENCODING="${ENCODING:-UTF8}"
+          LOCALE="${LOCALE:-en_US.UTF-8}"
+
+          mkdir -p "${DATADIR}"
+
+          echo "Initializing PostgreSQL cluster"
+          echo "  BASEDIR : ${BASEDIR}"
+          echo "  DATADIR : ${DATADIR}"
+          echo "  USER    : ${PG_USER}"
+          echo "  ENCODING: ${ENCODING}"
+
+          "${BASEDIR}/bin/initdb" \
+            --pgdata="${DATADIR}" \
+            --username="${PG_USER}" \
+            --encoding="${ENCODING}" \
+            --locale="${LOCALE}" \
+            --auth=trust
+
+          echo ""
+          echo "Init done. Start with:"
+          echo "  ${BASEDIR}/scripts/start-pg.sh"
+          INITSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/start-pg.sh" << 'STARTSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          PORT="${PORT:-5432}"
+          LOGFILE="${LOGFILE:-${BASEDIR}/logs/postgresql.log}"
+          SOCKET_DIR="${SOCKET_DIR:-${BASEDIR}/run}"
+
+          mkdir -p "${SOCKET_DIR}" "$(dirname "${LOGFILE}")"
+
+          exec "${BASEDIR}/bin/pg_ctl" start \
+            --pgdata="${DATADIR}" \
+            --log="${LOGFILE}" \
+            --options="-p ${PORT} -k ${SOCKET_DIR}" \
+            "$@"
+          STARTSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/stop-pg.sh" << 'STOPSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          "${BASEDIR}/bin/pg_ctl" stop \
+            --pgdata="${DATADIR}" \
+            --mode=fast
+          STOPSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/status-pg.sh" << 'STATUSSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          "${BASEDIR}/bin/pg_ctl" status --pgdata="${DATADIR}"
+          STATUSSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/psql.sh" << 'PSQLSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-5432}"
+          SOCKET_DIR="${SOCKET_DIR:-${BASEDIR}/run}"
+          exec "${BASEDIR}/bin/psql" \
+            -h "${SOCKET_DIR}" \
+            -p "${PORT}" \
+            "$@"
+          PSQLSCRIPT
+
+          chmod +x "${INSTALL_PREFIX}/scripts/"*.sh
+
+          # ----------------------------------------------------------------
+          # 验证
+          # ----------------------------------------------------------------
+          echo "--- Binary check ---"
+          FAIL=0
+          for bin in postgres psql pg_ctl initdb pg_dump; do
+            BIN_PATH="${INSTALL_PREFIX}/bin/${bin}.bin"
+            if [[ -f "${BIN_PATH}" ]]; then
+              echo "  OK  ${bin}"
+              MISSING=$(ldd "${BIN_PATH}" 2>/dev/null | grep 'not found' || true)
+              if [[ -n "${MISSING}" ]]; then
+                echo "  WARNING: unresolved deps:"
+                echo "${MISSING}"
+              fi
+              objdump -p "${BIN_PATH}" 2>/dev/null \
+                | grep -o 'GLIBC_[0-9.]*' \
+                | sort -V | tail -1 \
+                | xargs -I{} echo "    min glibc: {}" || true
+            else
+              echo "  MISSING ${bin}.bin"
+              FAIL=1
+            fi
+          done
+          [[ "${FAIL}" == "0" ]] || { echo "ERROR: required binaries missing"; exit 1; }
+
+          echo "--- Version ---"
+          "${INSTALL_PREFIX}/bin/postgres" --version
+          "${INSTALL_PREFIX}/bin/psql"     --version
+
+          # ----------------------------------------------------------------
+          # 打包
+          # ----------------------------------------------------------------
+          PKG_NAME="postgresql-${FULL_VERSION}-debian12-${BUILD_ARCH}"
+          cd /opt
+          tar -czf "/output/${PKG_NAME}.tar.gz" "postgresql-${FULL_VERSION}/"
+
+          cd /output
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          SHA256=$(sha256sum "${PKG_NAME}.tar.gz" | cut -d' ' -f1)
+          BUILD_GLIBC=$(ldd --version 2>/dev/null | head -1 \
+                        | grep -o '[0-9][0-9.]*$' || echo 'unknown')
+
+          cat > "${PKG_NAME}.json" << JSON
+          {
+            "pg_version":     "${FULL_VERSION}",
+            "major_version":  "${PG_MAJOR}",
+            "arch":           "${BUILD_ARCH}",
+            "os":             "linux",
+            "min_glibc":      "${BUILD_GLIBC}",
+            "install_prefix": "${INSTALL_PREFIX}",
+            "bundled_libs":   true,
+            "extensions":     "contrib",
+            "package":        "${PKG_NAME}.tar.gz",
+            "sha256":         "${SHA256}",
+            "build_date":     "${BUILD_DATE}",
+            "build_commit":   "${GIT_COMMIT:-unknown}",
+            "build_run":      "${BUILD_RUN:-0}"
+          }
+          JSON
+
+          echo "Package ready:"
+          ls -lh /output/*.tar.gz
+          SCRIPT
+
+          chmod +x scripts/do-build.sh
+
+      - name: Build inside Debian 12 container
+        run: |
+          mkdir -p output
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -v "${{ github.workspace }}/src:/src:ro" \
+            -v "${{ github.workspace }}/scripts:/scripts:ro" \
+            -v "${{ github.workspace }}/output:/output" \
+            -e PG_MAJOR="${{ matrix.version }}" \
+            -e FULL_VERSION="${{ matrix.full_version }}" \
+            -e TARBALL="${{ matrix.tarball }}" \
+            -e BUILD_ARCH="${{ matrix.build_arch }}" \
+            -e GIT_COMMIT="${{ github.sha }}" \
+            -e BUILD_RUN="${{ github.run_number }}" \
+            debian:12 \
+            bash /scripts/do-build.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgresql-${{ matrix.full_version }}-debian12-${{ matrix.build_arch }}
+          path: output/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-pg-${{ matrix.full_version }}-debian12-${{ matrix.build_arch }}
+          path: output/*.sha256
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-pg-${{ matrix.full_version }}-debian12-${{ matrix.build_arch }}
+          path: output/*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-pg-${{ matrix.full_version }}-${{ matrix.build_arch }}
+          path: output/logs/
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 4: 发布
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    if: needs.resolve.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download tar.gz artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: postgresql-*-debian12-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download sha256 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sha256-pg-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download json artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: json-pg-*
+          path: release/
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          cd release
+          ls -lhR
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ needs.resolve.outputs.release_tag }}"
+          DATE_CN=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
+          REPO="${{ github.repository }}"
+          COMMIT="${{ github.sha }}"
+
+          cat > release-notes.md << NOTES
+          ## PostgreSQL Multi-Version Build - ${TAG}
+
+          | Item | Value |
+          |------|-------|
+          | Build time | ${DATE_CN} |
+          | Trigger | ${{ github.event_name }} |
+          | Commit | ${COMMIT:0:8} |
+          | Run | #${{ github.run_number }} |
+
+          ### Packages
+
+          All packages include bundled runtime libraries and contrib extensions.
+          Minimum requirement: Linux kernel >= 3.10, glibc >= 2.36.
+          Build OS: debian:12.
+
+          | Major | Full Version | amd64 | arm64 |
+          |-------|-------------|-------|-------|
+          | 14 | latest patch | ✅ | ✅ |
+          | 15 | latest patch | ✅ | ✅ |
+          | 16 | latest patch | ✅ | ✅ |
+          | 17 | latest patch | ✅ | ✅ |
+          | 18 | latest patch | ✅ | ✅ |
+
+          ### Features
+
+          | Feature | Status |
+          |---------|--------|
+          | SSL/TLS | ✅ (--with-openssl) |
+          | ICU | ✅ (--with-icu) |
+          | XML / XSLT | ✅ |
+          | LDAP | ✅ |
+          | GSSAPI/Kerberos | ✅ |
+          | PAM | ✅ |
+          | LZ4 | ✅ (>= 14) |
+          | Zstandard | ✅ (>= 15) |
+          | Perl PL | ✅ |
+          | Python PL | ✅ (python3) |
+          | Tcl PL | ✅ |
+          | contrib | ✅ (all standard extensions) |
+          | Bundled libs | ✅ |
+
+          ### Install
+
+          \`\`\`bash
+          # Example: PostgreSQL 17.x on amd64 (replace with actual version)
+          ASSET="postgresql-17.5-debian12-amd64.tar.gz"
+          wget https://github.com/${REPO}/releases/download/${TAG}/\${ASSET}
+          wget https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+
+          # Extract to /opt (or any directory)
+          sudo tar -xzf \${ASSET} -C /opt/
+          # or user-local
+          tar -xzf \${ASSET} -C ~/
+
+          # Initialize cluster (first time only)
+          DATADIR=/opt/postgresql-17.5/data \\
+            /opt/postgresql-17.5/scripts/initdb.sh
+
+          # Start
+          PORT=5432 /opt/postgresql-17.5/scripts/start-pg.sh
+
+          # Connect
+          /opt/postgresql-17.5/scripts/psql.sh -U \$(whoami)
+
+          # Status
+          /opt/postgresql-17.5/scripts/status-pg.sh
+
+          # Stop
+          /opt/postgresql-17.5/scripts/stop-pg.sh
+          \`\`\`
+
+          ### Directory structure
+
+          \`\`\`
+          /opt/postgresql-<version>/
+          ├── bin/
+          │   ├── postgres           # wrapper (sets LD_LIBRARY_PATH)
+          │   ├── postgres.bin       # real binary
+          │   ├── psql / psql.bin
+          │   ├── initdb / initdb.bin
+          │   ├── pg_ctl / pg_ctl.bin
+          │   ├── pg_dump / pg_dump.bin
+          │   └── ...
+          ├── lib/
+          │   ├── postgresql/        # extensions (.so plugins)
+          │   └── private/           # bundled runtime .so files
+          ├── share/postgresql/      # SQL files, timezone data, etc.
+          ├── include/               # C headers
+          ├── data/                  # cluster data directory (after initdb)
+          ├── logs/                  # log files
+          ├── run/                   # Unix socket / PID file
+          └── scripts/
+              ├── initdb.sh          # initialize cluster
+              ├── start-pg.sh        # start server
+              ├── stop-pg.sh         # stop server (fast mode)
+              ├── status-pg.sh       # show server status
+              └── psql.sh            # quick psql via Unix socket
+          \`\`\`
+          NOTES
+
+      - name: Delete existing nightly release
+        if: startsWith(needs.resolve.outputs.release_tag, 'nightly-')
+        run: |
+          gh release delete "${{ needs.resolve.outputs.release_tag }}" \
+            --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.resolve.outputs.release_tag }}
+          name:        "PostgreSQL Build ${{ needs.resolve.outputs.release_tag }}"
+          body_path:   release-notes.md
+          draft:       false
+          prerelease:  ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/*.json
+            release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Job 5: 汇总
+  # ============================================================
+  summary:
+    name: Build Summary
+    needs: [resolve, build, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
+          ## PostgreSQL Build Summary
+          SUMMARY
+
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+
+          | Item | Value |
+          |------|-------|
+          | Trigger | ${{ github.event_name }} |
+          | Release Tag | ${{ needs.resolve.outputs.release_tag }} |
+          | Should Release | ${{ needs.resolve.outputs.should_release }} |
+          | Build Result | ${{ needs.build.result }} |
+          | Release Result | ${{ needs.release.result }} |
+
+          | Major | Build OS | SSL | ICU | LZ4 | Zstd | Bundled Libs | contrib |
+          |-------|---------|-----|-----|-----|------|--------------|---------|
+          | 14 | debian:12 | yes | yes | yes | no  | yes | yes |
+          | 15 | debian:12 | yes | yes | yes | yes | yes | yes |
+          | 16 | debian:12 | yes | yes | yes | yes | yes | yes |
+          | 17 | debian:12 | yes | yes | yes | yes | yes | yes |
+          | 18 | debian:12 | yes | yes | yes | yes | yes | yes |
+          SUMMARY
