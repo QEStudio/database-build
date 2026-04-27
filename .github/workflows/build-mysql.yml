@@ -1,0 +1,1019 @@
+name: Build MySQL Multi-Version
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/build-mysql.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-mysql.yml'
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      mysql_versions:
+        description: 'MySQL versions (comma-separated: 5.7,8.0,8.4,9.7)'
+        required: false
+        default: '5.7,8.0,8.4,9.7'
+      architectures:
+        description: 'Architectures (comma-separated: amd64,arm64)'
+        required: false
+        default: 'amd64,arm64'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Job 1: 生成编译矩阵
+  # ============================================================
+  prepare:
+    name: Prepare Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:         ${{ steps.gen.outputs.matrix }}
+      release_tag:    ${{ steps.gen.outputs.release_tag }}
+      should_release: ${{ steps.gen.outputs.should_release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate matrix and release info
+        id: gen
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+
+          CST = timezone(timedelta(hours=8))
+          now_cst = datetime.now(CST)
+          date_tag = now_cst.strftime('%Y%m%d')
+
+          ALL_VERSIONS = {
+            '5.7': {
+              'version':      '5.7',
+              'full_version': '5.7.44',
+              'tarball':      'mysql-boost-5.7.44.tar.gz',
+              'src_dir':      'mysql-5.7.44',
+              'url':          'https://downloads.mysql.com/archives/get/p/23/file/mysql-boost-5.7.44.tar.gz',
+              'boost_mode':   'bundled',
+              'build_image':  'debian:11',
+              'extra_gcc':    '',
+            },
+            '8.0': {
+              'version':      '8.0',
+              'full_version': '8.0.45',
+              'tarball':      'mysql-boost-8.0.45.tar.gz',
+              'src_dir':      'mysql-8.0.45',
+              'url':          'https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-boost-8.0.45.tar.gz',
+              'boost_mode':   'bundled',
+              'build_image':  'debian:11',
+              'extra_gcc':    '',
+            },
+            '8.4': {
+              'version':      '8.4',
+              'full_version': '8.4.9',
+              'tarball':      'mysql-8.4.9.tar.gz',
+              'src_dir':      'mysql-8.4.9',
+              'url':          'https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.9.tar.gz',
+              'boost_mode':   'none',
+              'build_image':  'debian:12',
+              'extra_gcc':    '',
+            },
+            '9.7': {
+              'version':      '9.7',
+              'full_version': '9.7.0',
+              'tarball':      'mysql-9.7.0.tar.gz',
+              'src_dir':      'mysql-9.7.0',
+              'url':          'https://dev.mysql.com/get/Downloads/MySQL-9.7/mysql-9.7.0.tar.gz',
+              'boost_mode':   'none',
+              'build_image':  'debian:12',
+              'extra_gcc':    '',
+            },
+          }
+
+          req_versions = os.environ.get('INPUT_VERSIONS', '5.7,8.0,8.4,9.7').split(',')
+          req_versions = [v.strip() for v in req_versions if v.strip()]
+          req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
+          req_arches   = [a.strip() for a in req_arches if a.strip()]
+
+          include = []
+          for ver in req_versions:
+            if ver not in ALL_VERSIONS:
+              continue
+            cfg = ALL_VERSIONS[ver]
+            for arch in req_arches:
+              entry = dict(cfg)
+              entry['build_arch'] = arch          # 用 build_arch 避免污染 make 系统变量
+              entry['platform']   = f'linux/{arch}'
+              include.append(entry)
+
+          event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
+          ref     = os.environ.get('GITHUB_REF', '')
+          run_num = os.environ.get('GITHUB_RUN_NUMBER', '0')
+
+          if event == 'push' and ref.startswith('refs/tags/'):
+            release_tag    = ref.replace('refs/tags/', '')
+            should_release = 'true'
+          elif event == 'schedule':
+            release_tag    = f'nightly-{date_tag}'
+            should_release = 'true'
+          elif event in ('push', 'workflow_dispatch') and \
+               ref in ('refs/heads/main', 'refs/heads/master'):
+            release_tag    = f'build-{date_tag}-{run_num}'
+            should_release = 'true'
+          else:
+            release_tag    = f'dev-{date_tag}'
+            should_release = 'false'
+
+          matrix = json.dumps({'include': include})
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'matrix={matrix}\n')
+            f.write(f'release_tag={release_tag}\n')
+            f.write(f'should_release={should_release}\n')
+
+          print(f'Matrix ({len(include)} jobs):')
+          for e in include:
+            print(f"  MySQL {e['full_version']} / {e['build_arch']} / image={e['build_image']}")
+          print(f'Release tag: {release_tag}')
+          PYEOF
+        env:
+          INPUT_VERSIONS:    ${{ github.event.inputs.mysql_versions || '5.7,8.0,8.4,9.7' }}
+          INPUT_ARCHES:      ${{ github.event.inputs.architectures  || 'amd64,arm64' }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF:        ${{ github.ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+
+  # ============================================================
+  # Job 2: 下载源码（静态矩阵，每版本一次）
+  # ============================================================
+  download:
+    name: Download MySQL ${{ matrix.full_version }} source
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - version:      '5.7'
+            full_version: '5.7.44'
+            tarball:      'mysql-boost-5.7.44.tar.gz'
+            url:          'https://downloads.mysql.com/archives/get/p/23/file/mysql-boost-5.7.44.tar.gz'
+          - version:      '8.0'
+            full_version: '8.0.45'
+            tarball:      'mysql-boost-8.0.45.tar.gz'
+            url:          'https://dev.mysql.com/get/Downloads/MySQL-8.0/mysql-boost-8.0.45.tar.gz'
+          - version:      '8.4'
+            full_version: '8.4.9'
+            tarball:      'mysql-8.4.9.tar.gz'
+            url:          'https://dev.mysql.com/get/Downloads/MySQL-8.4/mysql-8.4.9.tar.gz'
+          - version:      '9.7'
+            full_version: '9.7.0'
+            tarball:      'mysql-9.7.0.tar.gz'
+            url:          'https://dev.mysql.com/get/Downloads/MySQL-9.7/mysql-9.7.0.tar.gz'
+      fail-fast: false
+
+    steps:
+      - name: Restore source cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: src/${{ matrix.tarball }}
+          key: mysql-src-${{ matrix.full_version }}
+
+      - name: Download source
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p src
+          echo "Downloading MySQL ${{ matrix.full_version }} from ${{ matrix.url }}"
+          for attempt in 1 2 3 4 5; do
+            if curl -fSL \
+                --retry 3 --retry-delay 15 \
+                --connect-timeout 60 --max-time 7200 \
+                -o "src/${{ matrix.tarball }}" \
+                "${{ matrix.url }}"; then
+              echo "Downloaded on attempt ${attempt}"
+              break
+            fi
+            echo "Attempt ${attempt} failed, waiting 30s..."
+            sleep 30
+            if [[ ${attempt} -eq 5 ]]; then
+              echo "::error::Download failed after 5 attempts"
+              exit 1
+            fi
+          done
+
+      - name: Integrity check
+        run: |
+          FILE="src/${{ matrix.tarball }}"
+          SIZE=$(stat -c%s "${FILE}")
+          echo "File: ${FILE}, Size: $(numfmt --to=iec ${SIZE})"
+          if [[ ${SIZE} -lt 52428800 ]]; then
+            echo "::error::File too small (${SIZE} bytes), likely a redirect/error page"
+            exit 1
+          fi
+          file "${FILE}" | grep -qE 'gzip|tar' || {
+            echo "::error::Not a valid tar.gz"
+            exit 1
+          }
+          echo "Integrity check passed"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: src-mysql-${{ matrix.full_version }}
+          path: src/${{ matrix.tarball }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ============================================================
+  # Job 3: 编译
+  # ============================================================
+  build:
+    name: "MySQL ${{ matrix.full_version }} / ${{ matrix.build_arch }}"
+    needs: [prepare, download]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: src-mysql-${{ matrix.full_version }}
+          path: src/
+
+      - name: Write build script
+        run: |
+          mkdir -p scripts
+
+          # -------------------------------------------------------
+          # 关键：用 << 'SCRIPT'（单引号）使 heredoc 内容不展开。
+          # 脚本内部的 patchelf --set-rpath 参数必须用单引号包裹
+          # '$ORIGIN/...' 以便写入文件后 bash 执行时正确处理，
+          # 同时配合 set -u 不会把 $ORIGIN 当未定义变量。
+          # -------------------------------------------------------
+          cat > scripts/do-build.sh << 'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+
+          MYSQL_VERSION="${MYSQL_VERSION}"
+          FULL_VERSION="${FULL_VERSION}"
+          TARBALL="${TARBALL}"
+          SRC_DIR="${SRC_DIR}"
+          BOOST_MODE="${BOOST_MODE}"
+          EXTRA_GCC="${EXTRA_GCC}"
+          BUILD_ARCH="${BUILD_ARCH}"          # 仅用于命名打包，不影响 make 系统
+          INSTALL_PREFIX="/opt/mysql-${FULL_VERSION}"
+          BUILD_ROOT="/build"
+          LOG_DIR="/output/logs"
+
+          mkdir -p "${LOG_DIR}" "${BUILD_ROOT}"
+
+          echo "========================================"
+          echo "MySQL ${FULL_VERSION} / ${BUILD_ARCH}"
+          echo "OS:         $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
+          echo "Boost mode: ${BOOST_MODE}"
+          echo "Cores:      $(nproc)"
+          echo "Memory:     $(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo) MB"
+          echo "========================================"
+
+          # ----------------------------------------------------------------
+          # 安装依赖
+          # ----------------------------------------------------------------
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq 2>&1 | tee "${LOG_DIR}/apt.log"
+
+          # 所有版本通用基础包（含 bison/flex，9.7 router 需要）
+          PKGS=(
+            build-essential
+            cmake
+            ninja-build
+            pkg-config
+            ca-certificates
+            file
+            gzip
+            procps
+            patchelf
+            bison
+            flex
+            libssl-dev
+            libncurses-dev
+            libaio-dev
+            libreadline-dev
+            libnuma-dev
+            zlib1g-dev
+            libbz2-dev
+            liblzma-dev
+            liblz4-dev
+            libzstd-dev
+            libcurl4-openssl-dev
+            libedit-dev
+          )
+
+          # 5.7 / 8.0 使用 bundled boost，需要系统 boost 头文件辅助
+          if [[ "${MYSQL_VERSION}" == "5.7" || "${MYSQL_VERSION}" == "8.0" ]]; then
+            PKGS+=(
+              libboost-dev
+              libboost-program-options-dev
+              libboost-filesystem-dev
+              libboost-thread-dev
+              libboost-regex-dev
+            )
+          fi
+
+          # 8.0+ 需要 ICU 和 libevent
+          if [[ "${MYSQL_VERSION}" != "5.7" ]]; then
+            PKGS+=( libicu-dev libevent-dev )
+          fi
+
+          # 指定 GCC 版本（可选）
+          if [[ -n "${EXTRA_GCC}" ]]; then
+            PKGS+=( "${EXTRA_GCC}" "g++-${EXTRA_GCC#gcc-}" )
+          fi
+
+          apt-get install -y --no-install-recommends "${PKGS[@]}" \
+            2>&1 | tee -a "${LOG_DIR}/apt.log"
+
+          # libfido2（8.4 / 9.7 可选）
+          HAVE_FIDO2=0
+          if [[ "${MYSQL_VERSION}" == "8.4" || "${MYSQL_VERSION}" == "9.7" ]]; then
+            if apt-get install -y --no-install-recommends libfido2-dev \
+                2>&1 | tee -a "${LOG_DIR}/apt.log"; then
+              HAVE_FIDO2=1
+              echo "libfido2-dev installed"
+            else
+              echo "libfido2-dev not available, will disable fido2 plugin"
+            fi
+          fi
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          # 设置指定 GCC
+          if [[ -n "${EXTRA_GCC}" ]]; then
+            GCC_VER="${EXTRA_GCC#gcc-}"
+            export CC="gcc-${GCC_VER}"
+            export CXX="g++-${GCC_VER}"
+          fi
+
+          # ----------------------------------------------------------------
+          # 解压
+          # ----------------------------------------------------------------
+          mkdir -p "${BUILD_ROOT}/src"
+          cd "${BUILD_ROOT}/src"
+          echo "Extracting ${TARBALL}..."
+          tar -xzf "/src/${TARBALL}"
+          [[ -d "${SRC_DIR}" ]] || {
+            echo "ERROR: ${SRC_DIR} not found after extraction"
+            ls -la
+            exit 1
+          }
+
+          # ----------------------------------------------------------------
+          # 生成器选择
+          # 5.7 不支持 Ninja，用传统 make
+          # ----------------------------------------------------------------
+          if [[ "${MYSQL_VERSION}" == "5.7" ]]; then
+            CMAKE_GENERATOR="Unix Makefiles"
+            BUILD_TOOL="make"
+          else
+            CMAKE_GENERATOR="Ninja"
+            BUILD_TOOL="ninja"
+          fi
+
+          # ----------------------------------------------------------------
+          # CMake 配置
+          # ----------------------------------------------------------------
+          mkdir -p "${BUILD_ROOT}/src/${SRC_DIR}/build"
+          cd "${BUILD_ROOT}/src/${SRC_DIR}/build"
+
+          CMAKE_ARGS=(
+            -G"${CMAKE_GENERATOR}"
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}"
+            -DWITH_SSL=system
+            -DENABLED_LOCAL_INFILE=1
+            -DWITH_UNIT_TESTS=OFF
+            -DWITH_DEBUG=OFF
+            -DENABLE_DTRACE=0
+            -DMYSQL_DATADIR="${INSTALL_PREFIX}/data"
+            -DSYSCONFDIR="${INSTALL_PREFIX}/etc"
+            -DCOMPILATION_COMMENT="MySQL ${FULL_VERSION} Debian/${BUILD_ARCH} GHActions"
+          )
+
+          # 指定 GCC 编译器
+          if [[ -n "${EXTRA_GCC}" ]]; then
+            GCC_VER="${EXTRA_GCC#gcc-}"
+            CMAKE_ARGS+=(
+              -DCMAKE_C_COMPILER="gcc-${GCC_VER}"
+              -DCMAKE_CXX_COMPILER="g++-${GCC_VER}"
+            )
+          fi
+
+          # Boost 处理
+          case "${BOOST_MODE}" in
+            bundled)
+              CMAKE_ARGS+=(
+                -DWITH_BOOST="../boost"
+                -DDOWNLOAD_BOOST=0
+              )
+              ;;
+            none) ;;
+          esac
+
+          # zlib
+          if [[ "${MYSQL_VERSION}" == "8.0" ]]; then
+            CMAKE_ARGS+=( -DWITH_ZLIB=bundled )
+          else
+            CMAKE_ARGS+=( -DWITH_ZLIB=system )
+          fi
+
+          # 8.0+ 特有选项
+          if [[ "${MYSQL_VERSION}" != "5.7" ]]; then
+            CMAKE_ARGS+=(
+              -DWITH_LZ4=system
+              -DWITH_ZSTD=system
+              -DWITH_ICU=system
+              -DWITH_EDITLINE=system
+              -DWITH_CURL=system
+              -DWITH_PROTOBUF=bundled
+            )
+          fi
+
+          # fido2
+          if [[ "${MYSQL_VERSION}" == "8.4" || "${MYSQL_VERSION}" == "9.7" ]]; then
+            if [[ "${HAVE_FIDO2}" == "0" ]]; then
+              CMAKE_ARGS+=( -DWITH_FIDO=none )
+            fi
+          fi
+
+          echo "CMake args:"
+          printf '  %s\n' "${CMAKE_ARGS[@]}"
+          cmake .. "${CMAKE_ARGS[@]}" 2>&1 | tee "${LOG_DIR}/cmake.log"
+
+          # ----------------------------------------------------------------
+          # 编译 & 安装
+          # ----------------------------------------------------------------
+          NPROC=$(nproc)
+          echo "Building with ${NPROC} jobs..."
+          ${BUILD_TOOL} -j"${NPROC}" 2>&1 | tee "${LOG_DIR}/build.log"
+          ${BUILD_TOOL} install       2>&1 | tee "${LOG_DIR}/install.log"
+
+          # ----------------------------------------------------------------
+          # 创建目录结构
+          # ----------------------------------------------------------------
+          mkdir -p \
+            "${INSTALL_PREFIX}/data" \
+            "${INSTALL_PREFIX}/logs" \
+            "${INSTALL_PREFIX}/run" \
+            "${INSTALL_PREFIX}/tmp" \
+            "${INSTALL_PREFIX}/etc" \
+            "${INSTALL_PREFIX}/lib/private" \
+            "${INSTALL_PREFIX}/scripts"
+
+          # ----------------------------------------------------------------
+          # 打包依赖库（排除 glibc 族）
+          # ----------------------------------------------------------------
+          PRIVATE_LIB="${INSTALL_PREFIX}/lib/private"
+
+          GLIBC_PATTERN='^(libc|libm|libdl|libpthread|librt|libnsl|libresolv|libutil|libcrypt|libgcc_s|ld-linux|ld-musl)[.\-]'
+
+          is_glibc_lib() {
+            basename "$1" | grep -qE "${GLIBC_PATTERN}"
+          }
+
+          declare -A visited
+
+          copy_lib() {
+            local lib="$1"
+            local real
+            real=$(readlink -f "${lib}" 2>/dev/null || echo "${lib}")
+            local bname
+            bname=$(basename "${real}")
+            is_glibc_lib "${bname}" && return 0
+            [[ -n "${visited[${bname}]+_}" ]] && return 0
+            visited["${bname}"]=1
+            if [[ ! -f "${PRIVATE_LIB}/${bname}" ]]; then
+              echo "  copy: ${bname}"
+              cp -L "${real}" "${PRIVATE_LIB}/${bname}"
+              chmod 755 "${PRIVATE_LIB}/${bname}"
+            fi
+            local dep
+            for dep in $(ldd "${real}" 2>/dev/null \
+                         | awk '/=>/{print $3}' \
+                         | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          }
+
+          echo "--- Collecting runtime dependencies ---"
+
+          while IFS= read -r -d '' binary; do
+            file "${binary}" | grep -qE 'ELF.*executable' || continue
+            echo "Scanning: $(basename "${binary}")"
+            for dep in $(ldd "${binary}" 2>/dev/null \
+                         | awk '/=>/{print $3}' \
+                         | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          done < <(find "${INSTALL_PREFIX}/bin" -maxdepth 1 -type f -print0)
+
+          while IFS= read -r -d '' sofile; do
+            for dep in $(ldd "${sofile}" 2>/dev/null \
+                         | awk '/=>/{print $3}' \
+                         | grep -v '^$' || true); do
+              copy_lib "${dep}"
+            done
+          done < <(find "${INSTALL_PREFIX}/lib" -name '*.so*' \
+                        -not -path '*/private/*' -type f -print0)
+
+          echo "Collected $(ls "${PRIVATE_LIB}" | wc -l) libraries:"
+          ls -lh "${PRIVATE_LIB}"
+
+          # ----------------------------------------------------------------
+          # patchelf 修正 RPATH
+          # 关键修复：用单引号包裹 $ORIGIN，避免 set -u 把它当未定义变量
+          # ----------------------------------------------------------------
+          echo "--- Patching RPATH ---"
+
+          # bin/ 可执行文件
+          while IFS= read -r -d '' f; do
+            file "${f}" | grep -qE 'ELF' || continue
+            echo "  patchelf bin: $(basename "${f}")"
+            patchelf --set-rpath '$ORIGIN/../lib/private:$ORIGIN/../lib' \
+              "${f}" 2>/dev/null || \
+              echo "  WARNING: patchelf failed for $(basename "${f}")"
+          done < <(find "${INSTALL_PREFIX}/bin" -maxdepth 1 -type f -print0)
+
+          # lib/ 下的 .so（插件等）
+          while IFS= read -r -d '' f; do
+            patchelf --set-rpath '$ORIGIN/private:$ORIGIN' \
+              "${f}" 2>/dev/null || true
+          done < <(find "${INSTALL_PREFIX}/lib" -name '*.so*' \
+                        -not -path '*/private/*' -type f -print0)
+
+          # lib/private/ 内互相依赖
+          while IFS= read -r -d '' f; do
+            patchelf --set-rpath '$ORIGIN' \
+              "${f}" 2>/dev/null || true
+          done < <(find "${PRIVATE_LIB}" -name '*.so*' -type f -print0)
+
+          # ----------------------------------------------------------------
+          # wrapper 脚本
+          # ----------------------------------------------------------------
+          echo "--- Generating wrapper scripts ---"
+
+          make_wrapper() {
+            local cmd="$1"
+            local real_bin="${INSTALL_PREFIX}/bin/${cmd}"
+            [[ -f "${real_bin}" ]] || return 0
+            mv "${real_bin}" "${real_bin}.bin"
+            # 注意：内层 heredoc 用 WRAPPER（不带引号），
+            # 使得 ${cmd} 在外层 bash 展开，$0/$@ 保持字面
+            cat > "${real_bin}" << WRAPPER
+          #!/bin/bash
+          SELF_DIR="\$(cd "\$(dirname "\$(readlink -f "\$0")")" && pwd)"
+          PRIVATE_LIB="\${SELF_DIR}/../lib/private"
+          MYSQL_LIB="\${SELF_DIR}/../lib"
+          if [ -d "\${PRIVATE_LIB}" ]; then
+            export LD_LIBRARY_PATH="\${PRIVATE_LIB}:\${MYSQL_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+          fi
+          exec "\${SELF_DIR}/${cmd}.bin" "\$@"
+          WRAPPER
+            chmod +x "${real_bin}"
+            echo "  wrapper: ${cmd}"
+          }
+
+          for cmd in mysqld mysql mysqldump mysqladmin mysqlcheck \
+                     mysqlimport mysqlshow mysqlslap mysql_upgrade \
+                     mysqld_safe mysql_safe_to_bootstrap \
+                     mysqlbinlog mysqlpump; do
+            make_wrapper "${cmd}"
+          done
+
+          # ----------------------------------------------------------------
+          # 管理脚本
+          # ----------------------------------------------------------------
+          echo "--- Generating management scripts ---"
+
+          cat > "${INSTALL_PREFIX}/scripts/init-mysql.sh" << 'INITSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          SOCKET="${SOCKET:-${BASEDIR}/run/mysql.sock}"
+          PORT="${PORT:-3306}"
+          MYSQL_USER="${MYSQL_USER:-$(whoami)}"
+          LOG_ERROR="${BASEDIR}/logs/error.log"
+
+          mkdir -p "${DATADIR}" "${BASEDIR}/run" "${BASEDIR}/logs" "${BASEDIR}/tmp"
+
+          echo "Initializing MySQL in ${BASEDIR}"
+          echo "  DATADIR : ${DATADIR}"
+          echo "  PORT    : ${PORT}"
+          echo "  USER    : ${MYSQL_USER}"
+
+          "${BASEDIR}/bin/mysqld" \
+            --initialize-insecure \
+            --user="${MYSQL_USER}" \
+            --basedir="${BASEDIR}" \
+            --datadir="${DATADIR}" \
+            --log-error="${LOG_ERROR}"
+
+          echo ""
+          echo "Init done (root password is empty). Start with:"
+          echo "  ${BASEDIR}/scripts/start-mysql.sh"
+          echo ""
+          echo "Then set root password:"
+          echo "  ${BASEDIR}/bin/mysql -u root --socket=${BASEDIR}/run/mysql.sock"
+          echo "  ALTER USER 'root'@'localhost' IDENTIFIED BY 'YourPassword';"
+          INITSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/start-mysql.sh" << 'STARTSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          SOCKET="${SOCKET:-${BASEDIR}/run/mysql.sock}"
+          PORT="${PORT:-3306}"
+          MYSQL_USER="${MYSQL_USER:-$(whoami)}"
+          LOG_ERROR="${BASEDIR}/logs/error.log"
+          PID_FILE="${BASEDIR}/run/mysql.pid"
+
+          mkdir -p "$(dirname "${SOCKET}")" "${BASEDIR}/logs" "${BASEDIR}/tmp"
+
+          exec "${BASEDIR}/bin/mysqld" \
+            --user="${MYSQL_USER}" \
+            --basedir="${BASEDIR}" \
+            --datadir="${DATADIR}" \
+            --socket="${SOCKET}" \
+            --pid-file="${PID_FILE}" \
+            --port="${PORT}" \
+            --log-error="${LOG_ERROR}" \
+            --tmpdir="${BASEDIR}/tmp" \
+            "$@"
+          STARTSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/stop-mysql.sh" << 'STOPSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          SOCKET="${SOCKET:-${BASEDIR}/run/mysql.sock}"
+          "${BASEDIR}/bin/mysqladmin" \
+            --socket="${SOCKET}" \
+            -u root \
+            shutdown
+          STOPSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/status-mysql.sh" << 'STATUSSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          SOCKET="${SOCKET:-${BASEDIR}/run/mysql.sock}"
+          PID_FILE="${BASEDIR}/run/mysql.pid"
+          if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+            echo "MySQL is running (PID=$(cat "${PID_FILE}"))"
+          else
+            echo "MySQL is not running"
+          fi
+          STATUSSCRIPT
+
+          cat > "${INSTALL_PREFIX}/scripts/mysql-cli.sh" << 'CLISCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          SOCKET="${SOCKET:-${BASEDIR}/run/mysql.sock}"
+          PORT="${PORT:-3306}"
+          exec "${BASEDIR}/bin/mysql" \
+            --socket="${SOCKET}" \
+            -u root \
+            "$@"
+          CLISCRIPT
+
+          chmod +x "${INSTALL_PREFIX}/scripts/"*.sh
+          echo "Management scripts generated"
+
+          # ----------------------------------------------------------------
+          # 验证
+          # ----------------------------------------------------------------
+          echo "--- Binary check ---"
+          FAIL=0
+          for bin in mysqld mysql mysqldump; do
+            BIN_PATH="${INSTALL_PREFIX}/bin/${bin}.bin"
+            if [[ -f "${BIN_PATH}" ]]; then
+              echo "  OK  ${bin}"
+              MISSING=$(ldd "${BIN_PATH}" 2>/dev/null | grep 'not found' || true)
+              if [[ -n "${MISSING}" ]]; then
+                echo "  WARNING: unresolved deps for ${bin}:"
+                echo "${MISSING}"
+              fi
+              objdump -p "${BIN_PATH}" 2>/dev/null \
+                | grep -o 'GLIBC_[0-9.]*' \
+                | sort -V | tail -1 \
+                | xargs -I{} echo "    min glibc: {}" || true
+            else
+              echo "  MISSING ${bin}.bin"
+              FAIL=1
+            fi
+          done
+          [[ "${FAIL}" == "0" ]] || { echo "ERROR: required binaries missing"; exit 1; }
+
+          echo "--- Version ---"
+          "${INSTALL_PREFIX}/bin/mysqld" --version
+          "${INSTALL_PREFIX}/bin/mysql"  --version
+
+          # ----------------------------------------------------------------
+          # 打包
+          # ----------------------------------------------------------------
+          PKG_NAME="mysql-${FULL_VERSION}-debian12-${BUILD_ARCH}"
+          cd /opt
+          tar -czf "/output/${PKG_NAME}.tar.gz" "mysql-${FULL_VERSION}/"
+
+          cd /output
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          SHA256=$(sha256sum "${PKG_NAME}.tar.gz" | cut -d' ' -f1)
+          BUILD_GLIBC=$(ldd --version 2>/dev/null | head -1 \
+                        | grep -o '[0-9][0-9.]*$' || echo 'unknown')
+
+          cat > "${PKG_NAME}.json" << JSON
+          {
+            "mysql_version":  "${FULL_VERSION}",
+            "major_version":  "${MYSQL_VERSION}",
+            "arch":           "${BUILD_ARCH}",
+            "os":             "linux",
+            "min_glibc":      "${BUILD_GLIBC}",
+            "install_prefix": "${INSTALL_PREFIX}",
+            "bundled_libs":   true,
+            "package":        "${PKG_NAME}.tar.gz",
+            "sha256":         "${SHA256}",
+            "build_date":     "${BUILD_DATE}",
+            "build_commit":   "${GIT_COMMIT:-unknown}",
+            "build_run":      "${BUILD_RUN:-0}"
+          }
+          JSON
+
+          echo "Package ready:"
+          ls -lh /output/*.tar.gz
+          SCRIPT
+
+          chmod +x scripts/do-build.sh
+
+      - name: Build inside container
+        run: |
+          mkdir -p output
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            -v "${{ github.workspace }}/src:/src:ro" \
+            -v "${{ github.workspace }}/scripts:/scripts:ro" \
+            -v "${{ github.workspace }}/output:/output" \
+            -e MYSQL_VERSION="${{ matrix.version }}" \
+            -e FULL_VERSION="${{ matrix.full_version }}" \
+            -e TARBALL="${{ matrix.tarball }}" \
+            -e SRC_DIR="${{ matrix.src_dir }}" \
+            -e BOOST_MODE="${{ matrix.boost_mode }}" \
+            -e EXTRA_GCC="${{ matrix.extra_gcc }}" \
+            -e BUILD_ARCH="${{ matrix.build_arch }}" \
+            -e GIT_COMMIT="${{ github.sha }}" \
+            -e BUILD_RUN="${{ github.run_number }}" \
+            "${{ matrix.build_image }}" \
+            bash /scripts/do-build.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-${{ matrix.full_version }}-debian12-${{ matrix.build_arch }}
+          path: output/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-mysql-${{ matrix.full_version }}-debian12-${{ matrix.build_arch }}
+          path: output/*.sha256
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload json artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-mysql-${{ matrix.full_version }}-debian12-${{ matrix.build_arch }}
+          path: output/*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-mysql-${{ matrix.full_version }}-${{ matrix.build_arch }}
+          path: output/logs/
+          retention-days: 3
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 4: 发布
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download tar.gz artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mysql-*-debian12-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download sha256 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sha256-mysql-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download json artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: json-mysql-*
+          path: release/
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          cd release
+          ls -lhR
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          DATE_CN=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
+          REPO="${{ github.repository }}"
+          COMMIT="${{ github.sha }}"
+
+          cat > release-notes.md << NOTES
+          ## MySQL Multi-Version Build - ${TAG}
+
+          | Item | Value |
+          |------|-------|
+          | Build time | ${DATE_CN} |
+          | Trigger | ${{ github.event_name }} |
+          | Commit | ${COMMIT:0:8} |
+          | Run | #${{ github.run_number }} |
+
+          ### Packages
+
+          All packages include bundled runtime libraries.
+          Minimum requirement: Linux kernel >= 3.10, glibc >= 2.31.
+
+          | MySQL | Full Version | Build OS | amd64 | arm64 |
+          |-------|-------------|----------|-------|-------|
+          | 5.7 | 5.7.44 | debian:11 | ✅ | ✅ |
+          | 8.0 | 8.0.45 | debian:11 | ✅ | ✅ |
+          | 8.4 | 8.4.9  | debian:12 | ✅ | ✅ |
+          | 9.7 | 9.7.0  | debian:12 | ✅ | ✅ |
+
+          ### Install
+
+          \`\`\`bash
+          # Example: MySQL 8.4.9 on amd64
+          ASSET="mysql-8.4.9-debian12-amd64.tar.gz"
+          wget https://github.com/${REPO}/releases/download/${TAG}/\${ASSET}
+          wget https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+
+          # Extract to /opt (or any directory)
+          sudo tar -xzf \${ASSET} -C /opt/
+          # or user-local
+          tar -xzf \${ASSET} -C ~/
+
+          # Initialize cluster (first time, root password is empty)
+          DATADIR=/opt/mysql-8.4.9/data \\
+            /opt/mysql-8.4.9/scripts/init-mysql.sh
+
+          # Start (background)
+          PORT=3307 /opt/mysql-8.4.9/scripts/start-mysql.sh &
+
+          # Connect
+          /opt/mysql-8.4.9/scripts/mysql-cli.sh
+
+          # Status
+          /opt/mysql-8.4.9/scripts/status-mysql.sh
+
+          # Stop
+          /opt/mysql-8.4.9/scripts/stop-mysql.sh
+          \`\`\`
+
+          ### Directory structure
+
+          \`\`\`
+          /opt/mysql-<version>/
+          ├── bin/
+          │   ├── mysqld            # wrapper (sets LD_LIBRARY_PATH)
+          │   ├── mysqld.bin        # real binary
+          │   ├── mysql / mysql.bin
+          │   ├── mysqldump / mysqldump.bin
+          │   └── ...
+          ├── lib/
+          │   ├── plugin/           # MySQL plugins (.so)
+          │   └── private/          # bundled runtime .so files
+          ├── share/                # SQL files, charsets, etc.
+          ├── include/              # C headers
+          ├── data/                 # database files (after init)
+          ├── logs/                 # error log, slow log, etc.
+          ├── run/                  # socket / pid file
+          ├── tmp/                  # temp files
+          └── scripts/
+              ├── init-mysql.sh     # initialize data directory
+              ├── start-mysql.sh    # start mysqld
+              ├── stop-mysql.sh     # shutdown via mysqladmin
+              ├── status-mysql.sh   # check if running
+              └── mysql-cli.sh      # quick mysql -u root
+          \`\`\`
+          NOTES
+
+      - name: Delete existing nightly release
+        if: startsWith(needs.prepare.outputs.release_tag, 'nightly-')
+        run: |
+          gh release delete "${{ needs.prepare.outputs.release_tag }}" \
+            --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.prepare.outputs.release_tag }}
+          name:        "MySQL Build ${{ needs.prepare.outputs.release_tag }}"
+          body_path:   release-notes.md
+          draft:       false
+          prerelease:  ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/*.json
+            release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Job 5: 汇总
+  # ============================================================
+  summary:
+    name: Build Summary
+    needs: [prepare, build, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'SUMMARY'
+          ## MySQL Build Summary
+          SUMMARY
+
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY
+
+          | Item | Value |
+          |------|-------|
+          | Trigger | ${{ github.event_name }} |
+          | Release Tag | ${{ needs.prepare.outputs.release_tag }} |
+          | Should Release | ${{ needs.prepare.outputs.should_release }} |
+          | Build Result | ${{ needs.build.result }} |
+          | Release Result | ${{ needs.release.result }} |
+
+          | MySQL | Full Version | Build OS | Bundled Libs | SSL |
+          |-------|-------------|---------|--------------|-----|
+          | 5.7 | 5.7.44 | debian:11 | yes | yes |
+          | 8.0 | 8.0.45 | debian:11 | yes | yes |
+          | 8.4 | 8.4.9  | debian:12 | yes | yes |
+          | 9.7 | 9.7.0  | debian:12 | yes | yes |
+          SUMMARY

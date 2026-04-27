@@ -1,0 +1,1201 @@
+name: Build MongoDB Multi-Version from Source
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/build-mongodb.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/build-mongodb.yml'
+  schedule:
+    - cron: '0 17 * * 0'
+  workflow_dispatch:
+    inputs:
+      mongo_versions:
+        description: 'MongoDB versions (comma-separated: 4.4,5.0,6.0,7.0,8.0,8.2)'
+        required: false
+        default: '7.0,8.0,8.2'
+      architectures:
+        description: 'Architectures (comma-separated: amd64,arm64)'
+        required: false
+        default: 'amd64,arm64'
+      bazel_targets:
+        description: 'Bazel install target'
+        required: false
+        default: 'install-dist-test'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Job 1: 生成构建矩阵
+  # ============================================================
+  prepare:
+    name: Prepare Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:         ${{ steps.gen.outputs.matrix }}
+      release_tag:    ${{ steps.gen.outputs.release_tag }}
+      should_release: ${{ steps.gen.outputs.should_release }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate matrix
+        id: gen
+        run: |
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+
+          CST      = timezone(timedelta(hours=8))
+          date_tag = datetime.now(CST).strftime('%Y%m%d')
+
+          VERSION_TABLE = {
+            '4.4': {
+              'source_tag':   'r4.4.30',
+              'full_version': '4.4.30',
+              'python_ver':   '3.10',
+              'gcc_ver':      '11',
+              'use_bazel':    'false',
+            },
+            '5.0': {
+              'source_tag':   'r5.0.32',
+              'full_version': '5.0.32',
+              'python_ver':   '3.10',
+              'gcc_ver':      '11',
+              'use_bazel':    'false',
+            },
+            '6.0': {
+              'source_tag':   'r6.0.27',
+              'full_version': '6.0.27',
+              'python_ver':   '3.10',
+              'gcc_ver':      '11',
+              'use_bazel':    'false',
+            },
+            '7.0': {
+              'source_tag':   'r7.0.20',
+              'full_version': '7.0.20',
+              'python_ver':   '3.10',
+              'gcc_ver':      '12',
+              'use_bazel':    'false',
+            },
+            '8.0': {
+              'source_tag':   'r8.0.10',
+              'full_version': '8.0.10',
+              'python_ver':   '3.13',
+              'gcc_ver':      '14',
+              'use_bazel':    'true',
+            },
+            '8.2': {
+              'source_tag':   'r8.2.6',
+              'full_version': '8.2.6',
+              'python_ver':   '3.13',
+              'gcc_ver':      '14',
+              'use_bazel':    'true',
+            },
+          }
+
+          RUNNER_MAP = {
+            'amd64': 'ubuntu-22.04',
+            'arm64': 'ubuntu-22.04-arm',
+          }
+
+          req_versions = os.environ.get('INPUT_VERSIONS', '7.0,8.0,8.2').split(',')
+          req_versions = [v.strip() for v in req_versions if v.strip()]
+          req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
+          req_arches   = [a.strip() for a in req_arches if a.strip()]
+          bazel_target = os.environ.get('INPUT_BAZEL_TARGET', 'install-dist-test').strip()
+
+          include = []
+          for ver in req_versions:
+            if ver not in VERSION_TABLE:
+              print(f'WARNING: unknown version {ver}, skip')
+              continue
+            cfg = VERSION_TABLE[ver]
+            for arch in req_arches:
+              if arch not in RUNNER_MAP:
+                print(f'WARNING: unsupported arch {arch}, skip')
+                continue
+              include.append({
+                'version':      ver,
+                'full_version': cfg['full_version'],
+                'source_tag':   cfg['source_tag'],
+                'python_ver':   cfg['python_ver'],
+                'gcc_ver':      cfg['gcc_ver'],
+                'use_bazel':    cfg['use_bazel'],
+                'build_arch':   arch,
+                'runner':       RUNNER_MAP[arch],
+                'bazel_target': bazel_target,
+              })
+
+          event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
+          ref     = os.environ.get('GITHUB_REF', '')
+          run_num = os.environ.get('GITHUB_RUN_NUMBER', '0')
+
+          if event == 'push' and ref.startswith('refs/tags/'):
+            release_tag    = ref.replace('refs/tags/', '')
+            should_release = 'true'
+          elif event == 'schedule':
+            release_tag    = f'nightly-{date_tag}'
+            should_release = 'true'
+          elif event in ('push', 'workflow_dispatch') and \
+               ref in ('refs/heads/main', 'refs/heads/master'):
+            release_tag    = f'build-{date_tag}-{run_num}'
+            should_release = 'true'
+          else:
+            release_tag    = f'dev-{date_tag}'
+            should_release = 'false'
+
+          matrix = json.dumps({'include': include})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f'matrix={matrix}\n')
+            f.write(f'release_tag={release_tag}\n')
+            f.write(f'should_release={should_release}\n')
+
+          print(f'Matrix ({len(include)} jobs):')
+          for e in include:
+            print(f"  MongoDB {e['full_version']} / {e['build_arch']} "
+                  f"runner={e['runner']}  bazel={e['use_bazel']}")
+          print(f'Release tag    : {release_tag}')
+          print(f'Should release : {should_release}')
+          PYEOF
+        env:
+          INPUT_VERSIONS:     ${{ github.event.inputs.mongo_versions || '7.0,8.0,8.2' }}
+          INPUT_ARCHES:       ${{ github.event.inputs.architectures  || 'amd64,arm64' }}
+          INPUT_BAZEL_TARGET: ${{ github.event.inputs.bazel_targets  || 'install-dist-test' }}
+          GITHUB_EVENT_NAME:  ${{ github.event_name }}
+          GITHUB_REF:         ${{ github.ref }}
+          GITHUB_RUN_NUMBER:  ${{ github.run_number }}
+
+  # ============================================================
+  # Job 2: 编译
+  # ============================================================
+  build:
+    name: "MongoDB ${{ matrix.full_version }} / ${{ matrix.build_arch }}"
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 4
+
+    steps:
+      # ----------------------------------------------------------
+      # 0. 磁盘清理
+      # ----------------------------------------------------------
+      - name: Free disk space
+        run: |
+          echo "=== Disk before cleanup ==="
+          df -h
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            "$AGENT_TOOLSDIRECTORY" \
+            /opt/hostedtoolcache \
+            || true
+          sudo apt-get clean -qq
+          echo "=== Disk after cleanup ==="
+          df -h
+
+      # ----------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------
+      # 2. 系统依赖
+      # ----------------------------------------------------------
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl wget git \
+            libcurl4-openssl-dev \
+            liblzma-dev \
+            xz-utils \
+            zlib1g-dev \
+            libssl-dev \
+            pkg-config \
+            ninja-build \
+            ca-certificates \
+            software-properties-common \
+            apt-transport-https \
+            gnupg \
+            lsb-release \
+            python3-pip \
+            python3-dev
+
+      # ----------------------------------------------------------
+      # 3. 编译器
+      # ----------------------------------------------------------
+      - name: Install GCC ${{ matrix.gcc_ver }}
+        run: |
+          GCC_VER="${{ matrix.gcc_ver }}"
+          echo "Installing GCC ${GCC_VER} ..."
+
+          if [[ "${GCC_VER}" == "14" ]]; then
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update -qq
+          fi
+
+          sudo apt-get install -y --no-install-recommends \
+            gcc-${GCC_VER} g++-${GCC_VER}
+
+          sudo update-alternatives --install \
+            /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VER} 100 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-${GCC_VER}
+          sudo update-alternatives --set gcc /usr/bin/gcc-${GCC_VER}
+
+          echo "--- Compiler versions ---"
+          gcc --version
+          g++ --version
+
+      # ----------------------------------------------------------
+      # 4. Python 环境
+      # ----------------------------------------------------------
+      - name: Setup Python ${{ matrix.python_ver }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_ver }}
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+
+          PYTHON=$(which python3)
+          PIP="${PYTHON} -m pip"
+          echo "Python binary : ${PYTHON}"
+          echo "Python version: $(${PYTHON} --version)"
+
+          echo "=== Step 1: Upgrade pip ==="
+          ${PIP} install --upgrade pip
+
+          echo "=== Step 2: Install pinned setuptools + wheel ==="
+          ${PIP} install \
+            --no-cache-dir \
+            "setuptools>=60.0.0,<70.0.0" \
+            "wheel>=0.41.0"
+          ${PYTHON} -c "import pkg_resources; print('pkg_resources OK:', pkg_resources.__file__)"
+
+          echo "=== Step 3: Install pymongo (no-deps) + dnspython ==="
+          ${PIP} install --no-cache-dir --no-deps "pymongo>=4.0.0"
+          ${PIP} install --no-cache-dir "dnspython>=2.0.0"
+
+          echo "=== Step 4: Install remaining dependencies ==="
+          ${PIP} install \
+            --no-cache-dir \
+            "psutil>=5.9.0" \
+            "pyyaml>=6.0" \
+            "regex>=2023.0.0" \
+            "mypy>=1.0.0" \
+            "packaging>=23.0" \
+            "Cheetah3>=3.2.6"
+
+          echo "=== Step 5: Remove harmful packages ==="
+          for pkg in librt; do
+            if ${PIP} show "${pkg}" &>/dev/null; then
+              echo "Removing ${pkg}..."
+              ${PIP} uninstall -y "${pkg}"
+            else
+              echo "${pkg} not installed (OK)"
+            fi
+          done
+
+          echo "=== Step 6: Force reinstall setuptools (pinned < 70) ==="
+          ${PIP} install \
+            --force-reinstall \
+            --no-cache-dir \
+            "setuptools>=60.0.0,<70.0.0" \
+            "wheel>=0.41.0"
+
+          echo "=== Step 7: Full verification ==="
+          ${PYTHON} - <<'VERIFY'
+          import sys
+          print(f"Python: {sys.version}")
+          errors = []
+
+          from importlib.metadata import version, PackageNotFoundError
+          REQUIRED_PKGS = [
+            'setuptools', 'wheel', 'pymongo', 'dnspython',
+            'psutil', 'pyyaml', 'regex', 'mypy', 'packaging', 'cheetah3',
+          ]
+          print("--- Package metadata ---")
+          for pkg in REQUIRED_PKGS:
+            try:
+              ver = version(pkg)
+              print(f"  ✓ {pkg}: {ver}")
+            except PackageNotFoundError:
+              print(f"  ✗ {pkg}: NOT FOUND", file=sys.stderr)
+              errors.append(f"package not found: {pkg}")
+
+          print("--- pkg_resources import ---")
+          try:
+            import pkg_resources
+            st_ver = pkg_resources.get_distribution("setuptools").version
+            print(f"  ✓ pkg_resources: {pkg_resources.__file__}")
+            print(f"  ✓ setuptools via pkg_resources: {st_ver}")
+          except Exception as e:
+            errors.append(f"pkg_resources error: {e}")
+
+          print()
+          if errors:
+            for e in errors:
+              print(f"  - {e}", file=sys.stderr)
+            sys.exit(1)
+          else:
+            print("All checks passed ✓")
+          VERIFY
+
+      # ----------------------------------------------------------
+      # 5. 源码缓存 & 下载
+      # ----------------------------------------------------------
+      - name: Restore source cache
+        id: src-cache
+        uses: actions/cache@v4
+        with:
+          path: mongo-src-${{ matrix.source_tag }}.tar.gz
+          key: mongo-src-${{ matrix.source_tag }}
+
+      - name: Download MongoDB source
+        if: steps.src-cache.outputs.cache-hit != 'true'
+        run: |
+          TAG="${{ matrix.source_tag }}"
+          URL="https://github.com/mongodb/mongo/archive/refs/tags/${TAG}.tar.gz"
+          DEST="mongo-src-${TAG}.tar.gz"
+          echo "Downloading ${URL} ..."
+
+          for attempt in 1 2 3 4 5; do
+            echo "--- Attempt ${attempt}/5 ---"
+            if curl -fSL \
+                --retry 3 --retry-delay 15 \
+                --connect-timeout 30 --max-time 1800 \
+                -o "${DEST}" \
+                "${URL}"; then
+              echo "Downloaded successfully on attempt ${attempt}"
+              break
+            fi
+            if [[ ${attempt} -eq 5 ]]; then
+              echo "::error::Source download failed after 5 attempts"
+              exit 1
+            fi
+            echo "Attempt ${attempt} failed, waiting 30s..."
+            sleep 30
+          done
+
+          SIZE=$(stat -c%s "${DEST}")
+          echo "File size: $(numfmt --to=iec ${SIZE})"
+          if [[ ${SIZE} -lt 10485760 ]]; then
+            echo "::error::Tarball too small (${SIZE} bytes), likely corrupt"
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # 6. 解压源码
+      # ----------------------------------------------------------
+      - name: Extract source
+        run: |
+          TAG="${{ matrix.source_tag }}"
+          echo "Extracting mongo-src-${TAG}.tar.gz ..."
+          tar -xzf "mongo-src-${TAG}.tar.gz"
+
+          SRC_DIR=$(find . -maxdepth 1 -type d -name 'mongo-*' | head -1)
+          echo "Detected source dir: ${SRC_DIR}"
+          [[ -n "${SRC_DIR}" ]] || {
+            echo "::error::Source directory not found after extraction"
+            ls -la
+            exit 1
+          }
+          mv "${SRC_DIR}" mongo-src
+
+          echo "=== Disk after extraction ==="
+          df -h
+
+      # ----------------------------------------------------------
+      # 7a. SCons 路径（4.4 ~ 7.0）
+      # ----------------------------------------------------------
+      - name: Install SCons
+        if: matrix.use_bazel == 'false'
+        run: |
+          set -euo pipefail
+
+          PYTHON=$(which python3)
+          PIP="${PYTHON} -m pip"
+
+          echo "=== Installing SCons ==="
+          ${PIP} install --no-cache-dir 'scons>=4.4.1'
+
+          # SCons 安装后再次确保 setuptools 完整
+          ${PIP} install \
+            --force-reinstall \
+            --no-cache-dir \
+            "setuptools>=60.0.0,<70.0.0" \
+            "wheel>=0.41.0"
+
+          echo "--- SCons verification ---"
+          ${PYTHON} - <<'VERIFY'
+          import SCons, pkg_resources
+          print("✓ SCons      :", SCons.__version__)
+          print("✓ setuptools :", pkg_resources.get_distribution("setuptools").version)
+          print("✓ pkg_resources :", pkg_resources.__file__)
+          VERIFY
+
+          echo "--- SCons CLI ---"
+          ${PYTHON} -m SCons --version
+
+      - name: Install MongoDB Python build requirements
+        if: matrix.use_bazel == 'false'
+        run: |
+          set -euo pipefail
+
+          PYTHON=$(which python3)
+          PIP="${PYTHON} -m pip"
+          cd mongo-src
+
+          echo "=== Scanning MongoDB source for pip requirement files ==="
+
+          # MongoDB 不同版本 requirements 文件位置不同
+          REQ_FILES=(
+            "etc/pip/components/core.req"
+            "etc/pip/components/tooling.req"
+            "etc/pip/components/compile.req"
+            "etc/pip/components/artifact.req"
+            "etc/pip/components/testing.req"
+            "buildscripts/requirements.txt"
+            "buildscripts/requirements_build.txt"
+            "python-packages/requirements.txt"
+            "requirements.txt"
+          )
+
+          for req_file in "${REQ_FILES[@]}"; do
+            if [[ -f "${req_file}" ]]; then
+              echo "  Found: ${req_file}"
+              cat "${req_file}"
+              echo "---"
+              # 过滤掉已知有害包，逐行安装以避免单包失败中断整体
+              grep -v -iE '^\s*(librt|#|$)' "${req_file}" \
+                > /tmp/filtered_req.txt || true
+              if [[ -s /tmp/filtered_req.txt ]]; then
+                ${PIP} install \
+                  --no-cache-dir \
+                  -r /tmp/filtered_req.txt \
+                  || echo "WARNING: some packages in ${req_file} failed, continuing..."
+              fi
+            fi
+          done
+
+          # 使用 MongoDB 自带安装脚本（如果存在）
+          if [[ -f "buildscripts/install_requirements.py" ]]; then
+            echo "=== Running buildscripts/install_requirements.py ==="
+            ${PYTHON} buildscripts/install_requirements.py || true
+          fi
+
+          # 尝试从 PyPI 安装 mongo-tooling-metrics
+          echo "=== Trying PyPI: mongo-tooling-metrics ==="
+          ${PIP} install --no-cache-dir 'mongo-tooling-metrics' \
+            || echo "PyPI mongo-tooling-metrics not available, will try source or stub"
+
+          # 尝试从源码目录安装（MongoDB 7.0 可能内嵌了该包）
+          echo "=== Searching for mongo_tooling_metrics in source tree ==="
+          for metrics_dir in \
+            "buildscripts/metrics" \
+            "src/mongo/tooling_metrics" \
+            "buildscripts/tooling_metrics" \
+            "buildscripts/mongo_tooling_metrics"
+          do
+            if [[ -f "${metrics_dir}/setup.py" ]] || \
+               [[ -f "${metrics_dir}/pyproject.toml" ]]; then
+              echo "  Found installable package at: ${metrics_dir}"
+              ${PIP} install --no-cache-dir "${metrics_dir}/" \
+                || echo "WARNING: failed to install from ${metrics_dir}"
+              break
+            fi
+          done
+
+          # ----------------------------------------------------------------
+          # 兜底：如果 mongo_tooling_metrics 仍然不可用，创建 stub 模块
+          # ----------------------------------------------------------------
+          if ! ${PYTHON} -c "import mongo_tooling_metrics" 2>/dev/null; then
+            echo "=== Creating mongo_tooling_metrics stub ==="
+
+            SITE_PACKAGES=$(${PYTHON} -c \
+              "import site; print(site.getsitepackages()[0])")
+            STUB_ROOT="${SITE_PACKAGES}/mongo_tooling_metrics"
+            STUB_LIB="${STUB_ROOT}/lib"
+            mkdir -p "${STUB_LIB}"
+
+            # __init__.py
+            cat > "${STUB_ROOT}/__init__.py" << 'STUB'
+          # Stub: mongo_tooling_metrics (telemetry disabled)
+          __version__ = '0.0.0.stub'
+          STUB
+
+            # lib/__init__.py
+            cat > "${STUB_LIB}/__init__.py" << 'STUB'
+          # Stub lib
+          STUB
+
+            # lib/top_level_metrics.py — SConstruct 实际导入的类
+            cat > "${STUB_LIB}/top_level_metrics.py" << 'STUB'
+          # Stub for mongo_tooling_metrics.lib.top_level_metrics
+          # Disables MongoDB build telemetry without breaking the build.
+
+          class SConsToolingMetrics:
+              """No-op stub — telemetry collection disabled."""
+
+              def __init__(self, *args, **kwargs):
+                  pass
+
+              def __getattr__(self, name):
+                  return lambda *args, **kwargs: None
+
+              @classmethod
+              def get_instance(cls, *args, **kwargs):
+                  return cls()
+
+              @staticmethod
+              def register_metrics_collector(*args, **kwargs):
+                  pass
+
+              @staticmethod
+              def record_scons_start(*args, **kwargs):
+                  return None
+
+              @staticmethod
+              def record_scons_end(*args, **kwargs):
+                  return None
+          STUB
+
+            echo "Stub installed at: ${STUB_ROOT}"
+          fi
+
+          # ----------------------------------------------------------------
+          # 最终验证
+          # ----------------------------------------------------------------
+          echo "=== Verifying mongo_tooling_metrics ==="
+          ${PYTHON} - <<'VERIFY'
+          from mongo_tooling_metrics.lib.top_level_metrics import SConsToolingMetrics
+          print("✓ mongo_tooling_metrics imported OK")
+          print("  SConsToolingMetrics:", SConsToolingMetrics)
+          obj = SConsToolingMetrics()
+          print("  Instantiation OK:", obj)
+          VERIFY
+
+          # 重装 setuptools 确保 pkg_resources 完整性不被破坏
+          echo "=== Reinstall setuptools after all deps ==="
+          ${PIP} install \
+            --force-reinstall \
+            --no-cache-dir \
+            "setuptools>=60.0.0,<70.0.0" \
+            "wheel>=0.41.0"
+
+          ${PYTHON} -c "
+          import pkg_resources
+          print('pkg_resources OK:', pkg_resources.__file__)
+          print('setuptools:', pkg_resources.get_distribution('setuptools').version)
+          "
+
+          echo "=== Final pip list ==="
+          ${PIP} list | grep -iE \
+            '(setup|wheel|pymongo|scons|mongo|tooling|psutil|yaml|regex|packaging)'
+
+      - name: Restore SCons cache
+        if: matrix.use_bazel == 'false'
+        uses: actions/cache@v4
+        with:
+          path: mongo-src/.scons_cache
+          key: >-
+            scons-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-${{ hashFiles('mongo-src/SConstruct') }}
+          restore-keys: |
+            scons-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-
+            scons-${{ matrix.full_version }}-${{ matrix.build_arch }}-
+
+      - name: Build with SCons
+        if: matrix.use_bazel == 'false'
+        run: |
+          set -euo pipefail
+          cd mongo-src
+
+          PYTHON=$(which python3)
+          GCC_VER="${{ matrix.gcc_ver }}"
+          MAJOR="${{ matrix.version }}"
+          JOBS=$(nproc)
+          CACHE_DIR=".scons_cache"
+          INSTALL_PREFIX="$(pwd)/install"
+          mkdir -p "${CACHE_DIR}" "${INSTALL_PREFIX}"
+
+          echo "Building MongoDB ${MAJOR} | GCC ${GCC_VER} | -j${JOBS}"
+
+          # 编译前最终确认关键模块可用
+          ${PYTHON} - <<'PRECHECK'
+          import pkg_resources
+          from mongo_tooling_metrics.lib.top_level_metrics import SConsToolingMetrics
+          print("✓ pkg_resources   :", pkg_resources.__file__)
+          print("✓ setuptools      :", pkg_resources.get_distribution("setuptools").version)
+          print("✓ SConsToolingMetrics OK")
+          PRECHECK
+
+          case "${MAJOR}" in
+            4.4|5.0) INSTALL_TARGET="install-core" ;;
+            6.0|7.0) INSTALL_TARGET="install-dist-test" ;;
+            *)        INSTALL_TARGET="install-dist-test" ;;
+          esac
+
+          echo "Install target: ${INSTALL_TARGET}"
+
+          ${PYTHON} -m SCons \
+            CC=gcc-${GCC_VER} \
+            CXX=g++-${GCC_VER} \
+            -j${JOBS} \
+            --cache-dir="${CACHE_DIR}" \
+            --cache-size=8192 \
+            --cache-prune-ratio=0.1 \
+            --disable-warnings-as-errors \
+            MONGO_VERSION="${{ matrix.full_version }}" \
+            DESTDIR="${INSTALL_PREFIX}" \
+            "${INSTALL_TARGET}"
+
+          echo "--- Installed binaries ---"
+          find "${INSTALL_PREFIX}" \
+            \( -name 'mongod' -o -name 'mongos' -o -name 'mongo' \) \
+            | head -20
+
+      # ----------------------------------------------------------
+      # 7b. Bazel 路径（8.0+）
+      # ----------------------------------------------------------
+      - name: Install Bazel
+        if: matrix.use_bazel == 'true'
+        run: |
+          cd mongo-src
+          python3 buildscripts/install_bazel.py
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          echo "--- Bazel version ---"
+          "${HOME}/.local/bin/bazel" version || true
+
+      - name: Restore Bazel cache
+        if: matrix.use_bazel == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: >-
+            bazel-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-${{ hashFiles('mongo-src/WORKSPACE', 'mongo-src/MODULE.bazel', 'mongo-src/.bazelrc') }}
+          restore-keys: |
+            bazel-${{ matrix.full_version }}-${{ matrix.build_arch }}-gcc${{ matrix.gcc_ver }}-
+            bazel-${{ matrix.full_version }}-${{ matrix.build_arch }}-
+            bazel-${{ matrix.full_version }}-
+
+      - name: Build with Bazel
+        if: matrix.use_bazel == 'true'
+        run: |
+          set -euo pipefail
+          cd mongo-src
+
+          BAZEL_BIN="${HOME}/.local/bin/bazel"
+          BAZEL_TARGET="${{ matrix.bazel_target }}"
+          GCC_VER="${{ matrix.gcc_ver }}"
+          JOBS=$(nproc)
+
+          export CC=gcc-${GCC_VER}
+          export CXX=g++-${GCC_VER}
+
+          echo "Building: ${BAZEL_TARGET} | GCC ${GCC_VER} | -j${JOBS}"
+
+          "${BAZEL_BIN}" build \
+            --disk_cache="${HOME}/.cache/bazel" \
+            --jobs=${JOBS} \
+            --local_ram_resources=HOST_RAM*.85 \
+            --local_cpu_resources=HOST_CPUS*.9 \
+            --disable_warnings_as_errors=True \
+            "${BAZEL_TARGET}"
+
+          echo "--- Bazel outputs ---"
+          ls -lhR bazel-bin/install/bin/ 2>/dev/null || \
+            find bazel-bin -maxdepth 5 \
+              \( -name 'mongod' -o -name 'mongos' -o -name 'mongosh' \) \
+              2>/dev/null | head -20
+
+      # ----------------------------------------------------------
+      # 8. 收集产物 + 打包
+      # ----------------------------------------------------------
+      - name: Collect and package binaries
+        run: |
+          set -euo pipefail
+
+          FULL="${{ matrix.full_version }}"
+          BUILD_ARCH="${{ matrix.build_arch }}"
+          INSTALL_NAME="mongodb-${FULL}"
+          DIST_DIR="dist/${INSTALL_NAME}"
+          OUT_DIR="output"
+
+          mkdir -p \
+            "${DIST_DIR}/bin" \
+            "${DIST_DIR}/data" \
+            "${DIST_DIR}/logs" \
+            "${DIST_DIR}/run" \
+            "${DIST_DIR}/tmp" \
+            "${DIST_DIR}/etc" \
+            "${DIST_DIR}/scripts" \
+            "${OUT_DIR}"
+
+          echo "=== Searching for compiled binaries ==="
+          if [[ "${{ matrix.use_bazel }}" == "true" ]]; then
+            BIN_ROOTS=(
+              "mongo-src/bazel-bin/install/bin"
+              "mongo-src/bazel-bin/install-dist-test/bin"
+              "mongo-src/bazel-bin/install-core/bin"
+              "mongo-src/bazel-bin"
+            )
+          else
+            BIN_ROOTS=(
+              "mongo-src/install/usr/bin"
+              "mongo-src/install/usr/local/bin"
+              "mongo-src/install/bin"
+              "mongo-src/build"
+            )
+          fi
+
+          BINARIES=(mongod mongos mongo mongosh)
+          for bin in "${BINARIES[@]}"; do
+            FOUND=""
+            for root in "${BIN_ROOTS[@]}"; do
+              FOUND=$(find "${root}" -type f -name "${bin}" 2>/dev/null | head -1)
+              if [[ -n "${FOUND}" ]]; then
+                cp -v "${FOUND}" "${DIST_DIR}/bin/${bin}"
+                chmod +x "${DIST_DIR}/bin/${bin}"
+                break
+              fi
+            done
+            [[ -z "${FOUND}" ]] && echo "  Skipped: ${bin} (not found)"
+          done
+
+          [[ -f "${DIST_DIR}/bin/mongod" ]] || {
+            echo "::error::mongod not found"
+            find mongo-src -name 'mongod' 2>/dev/null | head -20 || true
+            exit 1
+          }
+
+          echo "--- Binary info ---"
+          ls -lh "${DIST_DIR}/bin/"
+          "${DIST_DIR}/bin/mongod" --version
+          MISSING=$(ldd "${DIST_DIR}/bin/mongod" 2>/dev/null | grep 'not found' || true)
+          [[ -n "${MISSING}" ]] && echo "WARNING: missing libs: ${MISSING}" || echo "ldd OK"
+
+          # ---- 配置模板 ----
+          cat > "${DIST_DIR}/etc/mongod.conf.default" << 'MONGOCFG'
+          # MongoDB configuration template
+          systemLog:
+            destination: file
+            path: __BASEDIR__/logs/mongod.log
+            logAppend: true
+            logRotate: reopen
+
+          storage:
+            dbPath: __BASEDIR__/data
+            journal:
+              enabled: true
+
+          net:
+            port: 27017
+            bindIp: 127.0.0.1
+
+          processManagement:
+            fork: false
+            pidFilePath: __BASEDIR__/run/mongod.pid
+          MONGOCFG
+
+          # ---- init-config.sh ----
+          cat > "${DIST_DIR}/scripts/init-config.sh" << 'INITSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+          PORT="${PORT:-27017}"
+          DATADIR="${DATADIR:-${BASEDIR}/data}"
+          LOGFILE="${LOGFILE:-${BASEDIR}/logs/mongod.log}"
+          PIDFILE="${PIDFILE:-${BASEDIR}/run/mongod.pid}"
+
+          if [[ -f "${CONFIG}" ]]; then
+            echo "Config exists: ${CONFIG}"
+            exit 0
+          fi
+
+          mkdir -p "${DATADIR}" \
+                   "$(dirname "${LOGFILE}")" \
+                   "$(dirname "${PIDFILE}")" \
+                   "${BASEDIR}/tmp"
+
+          sed -e "s|__BASEDIR__|${BASEDIR}|g" \
+              "${BASEDIR}/etc/mongod.conf.default" > "${CONFIG}"
+
+          sed -i "s|^    port: .*|    port: ${PORT}|"                       "${CONFIG}"
+          sed -i "s|path: .*logs/mongod.log|path: ${LOGFILE}|"              "${CONFIG}"
+          sed -i "s|dbPath: .*data|dbPath: ${DATADIR}|"                     "${CONFIG}"
+          sed -i "s|pidFilePath: .*run/mongod.pid|pidFilePath: ${PIDFILE}|" "${CONFIG}"
+
+          echo "Config : ${CONFIG}"
+          echo "Data   : ${DATADIR}"
+          echo "Log    : ${LOGFILE}"
+          echo "Port   : ${PORT}"
+          INITSCRIPT
+
+          # ---- start-mongod.sh ----
+          cat > "${DIST_DIR}/scripts/start-mongod.sh" << 'STARTSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          CONFIG="${CONFIG:-${BASEDIR}/etc/mongod.conf}"
+
+          [[ -f "${CONFIG}" ]] || {
+            echo "ERROR: Config not found: ${CONFIG}"
+            echo "       Run: ${BASEDIR}/scripts/init-config.sh"
+            exit 1
+          }
+
+          mkdir -p "${BASEDIR}/data" "${BASEDIR}/logs" \
+                   "${BASEDIR}/run"  "${BASEDIR}/tmp"
+
+          exec "${BASEDIR}/bin/mongod" --config "${CONFIG}" "$@"
+          STARTSCRIPT
+
+          # ---- stop-mongod.sh ----
+          cat > "${DIST_DIR}/scripts/stop-mongod.sh" << 'STOPSCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-27017}"
+          HOST="${HOST:-127.0.0.1}"
+          PID_FILE="${BASEDIR}/run/mongod.pid"
+
+          MONGO_CMD=""
+          for c in "${BASEDIR}/bin/mongosh" "${BASEDIR}/bin/mongo"; do
+            [[ -f "${c}" ]] && { MONGO_CMD="${c}"; break; }
+          done
+
+          if [[ -n "${MONGO_CMD}" ]]; then
+            "${MONGO_CMD}" --host "${HOST}" --port "${PORT}" --quiet \
+              --eval 'db.adminCommand({ shutdown: 1, force: true })' \
+              admin 2>/dev/null || true
+          elif [[ -f "${PID_FILE}" ]]; then
+            PID=$(cat "${PID_FILE}")
+            kill "${PID}" 2>/dev/null || echo "Process ${PID} not found"
+          else
+            echo "ERROR: no shell client and no PID file"
+            exit 1
+          fi
+
+          for i in $(seq 1 30); do
+            [[ ! -f "${PID_FILE}" ]] && { echo "mongod stopped."; exit 0; }
+            kill -0 "$(cat "${PID_FILE}" 2>/dev/null)" 2>/dev/null || \
+              { echo "mongod stopped."; exit 0; }
+            sleep 1
+          done
+          echo "WARNING: mongod may still be running"
+          STOPSCRIPT
+
+          # ---- status-mongod.sh ----
+          cat > "${DIST_DIR}/scripts/status-mongod.sh" << 'STATUSSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PID_FILE="${BASEDIR}/run/mongod.pid"
+          PORT="${PORT:-27017}"
+
+          if [[ -f "${PID_FILE}" ]]; then
+            PID=$(cat "${PID_FILE}")
+            if kill -0 "${PID}" 2>/dev/null; then
+              echo "mongod RUNNING (PID=${PID}, PORT=${PORT})"
+              exit 0
+            else
+              echo "mongod STOPPED (stale PID file)"
+              exit 1
+            fi
+          else
+            echo "mongod NOT running"
+            exit 1
+          fi
+          STATUSSCRIPT
+
+          # ---- mongo-shell.sh ----
+          cat > "${DIST_DIR}/scripts/mongo-shell.sh" << 'SHELLSCRIPT'
+          #!/bin/bash
+          BASEDIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+          PORT="${PORT:-27017}"
+          HOST="${HOST:-127.0.0.1}"
+          for c in "${BASEDIR}/bin/mongosh" "${BASEDIR}/bin/mongo"; do
+            [[ -f "${c}" ]] && exec "${c}" --host "${HOST}" --port "${PORT}" "$@"
+          done
+          echo "ERROR: mongosh/mongo not found in ${BASEDIR}/bin/"
+          exit 1
+          SHELLSCRIPT
+
+          chmod +x "${DIST_DIR}/scripts/"*.sh
+
+          # ---- BUILD_INFO ----
+          BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          MONGOD_VER=$("${DIST_DIR}/bin/mongod" --version 2>&1 | head -3)
+          BUILD_SYSTEM="${{ matrix.use_bazel == 'true' && 'Bazel' || 'SCons' }}"
+
+          cat > "${DIST_DIR}/BUILD_INFO" << INFO
+          MongoDB Source Build
+          ====================
+          Full Version : ${FULL}
+          Architecture : ${BUILD_ARCH}
+          Build System : ${BUILD_SYSTEM}
+          GCC Version  : ${{ matrix.gcc_ver }}
+          Build Date   : ${BUILD_DATE}
+          GH Run       : ${{ github.run_number }}
+          GH Commit    : ${{ github.sha }}
+
+          mongod --version:
+          ${MONGOD_VER}
+          INFO
+
+          # ---- 打包 ----
+          PKG_NAME="mongodb-src-${FULL}-linux-${BUILD_ARCH}"
+          echo "=== Packaging ${PKG_NAME} ==="
+
+          cd dist
+          tar -czf "../${OUT_DIR}/${PKG_NAME}.tar.gz" "${INSTALL_NAME}/"
+          cd ..
+
+          cd "${OUT_DIR}"
+          sha256sum "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
+          SHA256=$(cut -d' ' -f1 "${PKG_NAME}.tar.gz.sha256")
+
+          cat > "${PKG_NAME}.json" << JSON
+          {
+            "mongo_version":  "${FULL}",
+            "major_version":  "${{ matrix.version }}",
+            "arch":           "${BUILD_ARCH}",
+            "os":             "linux",
+            "source":         "compiled-from-source",
+            "source_tag":     "${{ matrix.source_tag }}",
+            "package":        "${PKG_NAME}.tar.gz",
+            "sha256":         "${SHA256}",
+            "build_date":     "${BUILD_DATE}",
+            "gcc_version":    "${{ matrix.gcc_ver }}",
+            "build_system":   "${{ matrix.use_bazel == 'true' && 'bazel' || 'scons' }}",
+            "workflow_run":   "${{ github.run_number }}",
+            "commit":         "${{ github.sha }}"
+          }
+          JSON
+
+          echo "=== Output files ==="
+          ls -lh "../${OUT_DIR}/"
+          echo "=== Disk ==="
+          df -h
+
+      # ----------------------------------------------------------
+      # 9. 清理
+      # ----------------------------------------------------------
+      - name: Cleanup build artifacts
+        if: always()
+        run: |
+          df -h
+          rm -rf mongo-src dist || true
+          df -h
+
+      # ----------------------------------------------------------
+      # 10. 上传产物
+      # ----------------------------------------------------------
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mongodb-src-${{ matrix.full_version }}-linux-${{ matrix.build_arch }}
+          path: output/*.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256-${{ matrix.full_version }}-${{ matrix.build_arch }}
+          path: output/*.sha256
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-${{ matrix.full_version }}-${{ matrix.build_arch }}
+          path: output/*.json
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ============================================================
+  # Job 3: 发布 Release
+  # ============================================================
+  release:
+    name: Create GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_release == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-staging/
+          merge-multiple: false
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release/
+          find release-staging/ -type f \
+            \( -name '*.tar.gz' -o -name '*.sha256' -o -name '*.json' \) \
+            -exec cp -v {} release/ \;
+
+          echo "=== Release contents ==="
+          ls -lhR release/
+
+          cd release/
+          sha256sum *.tar.gz > SHA256SUMS.txt 2>/dev/null || true
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          DATE_CN=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S CST')
+          REPO="${{ github.repository }}"
+          COMMIT="${{ github.sha }}"
+          SHORT="${COMMIT:0:8}"
+
+          cat > release-notes.md << NOTES
+          ## MongoDB Source Build — ${TAG}
+
+          > Compiled from official MongoDB source. Supports **amd64** and **arm64**.
+
+          | Item | Value |
+          |------|-------|
+          | Build time | ${DATE_CN} |
+          | Trigger | \`${{ github.event_name }}\` |
+          | Commit | [\`${SHORT}\`](https://github.com/${REPO}/commit/${COMMIT}) |
+          | Run | [#${{ github.run_number }}](https://github.com/${REPO}/actions/runs/${{ github.run_id }}) |
+
+          ---
+
+          ### Version Matrix
+
+          | Version | Source Tag | Build System | Compiler |
+          |---------|-----------|--------------|----------|
+          | 4.4 | \`r4.4.30\` | SCons | GCC 11 |
+          | 5.0 | \`r5.0.32\` | SCons | GCC 11 |
+          | 6.0 | \`r6.0.27\` | SCons | GCC 11 |
+          | 7.0 | \`r7.0.20\` | SCons | GCC 12 |
+          | 8.0 | \`r8.0.10\` | Bazel | GCC 14 |
+          | 8.2 | \`r8.2.6\`  | Bazel | GCC 14 |
+
+          ---
+
+          ### Quick Start
+
+          \`\`\`bash
+          TAG="${TAG}"
+          ASSET="mongodb-src-7.0.20-linux-arm64.tar.gz"
+
+          wget "https://github.com/${REPO}/releases/download/\${TAG}/\${ASSET}"
+          wget "https://github.com/${REPO}/releases/download/\${TAG}/SHA256SUMS.txt"
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+
+          sudo tar -xzf "\${ASSET}" -C /opt/
+          PORT=27017 /opt/mongodb-7.0.20/scripts/init-config.sh
+          /opt/mongodb-7.0.20/scripts/start-mongod.sh
+          /opt/mongodb-7.0.20/scripts/status-mongod.sh
+          /opt/mongodb-7.0.20/scripts/stop-mongod.sh
+          \`\`\`
+
+          ### Verify
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS.txt --ignore-missing
+          \`\`\`
+          NOTES
+
+      - name: Delete existing release
+        run: |
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          if gh release view "${TAG}" &>/dev/null; then
+            gh release delete "${TAG}" --yes --cleanup-tag
+            sleep 5
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:    ${{ needs.prepare.outputs.release_tag }}
+          name:        "MongoDB Source Build ${{ needs.prepare.outputs.release_tag }}"
+          body_path:   release-notes.md
+          draft:       false
+          prerelease:  ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            release/*.tar.gz
+            release/*.sha256
+            release/*.json
+            release/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Job 4: 汇总
+  # ============================================================
+  summary:
+    name: Build Summary
+    needs: [prepare, build, release]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Write summary
+        run: |
+          BUILD="${{ needs.build.result }}"
+          RELEASE="${{ needs.release.result }}"
+
+          b_icon="✅"; [[ "${BUILD}"   != "success" ]] && b_icon="❌"
+          r_icon="✅"
+          [[ "${RELEASE}" == "skipped" ]] && r_icon="⏭️"
+          [[ "${RELEASE}" == "failure" ]] && r_icon="❌"
+
+          cat >> "${GITHUB_STEP_SUMMARY}" << SUMMARY
+          ## MongoDB Source Build Summary
+
+          | Item | Value |
+          |------|-------|
+          | Trigger | \`${{ github.event_name }}\` |
+          | Release Tag | \`${{ needs.prepare.outputs.release_tag }}\` |
+          | Should Release | \`${{ needs.prepare.outputs.should_release }}\` |
+          | Build | ${b_icon} \`${BUILD}\` |
+          | Release | ${r_icon} \`${RELEASE}\` |
+
+          ### Version Matrix
+
+          | Version | Source Tag | Build System | Compiler |
+          |---------|-----------|--------------|----------|
+          | 4.4 | \`r4.4.30\` | SCons | GCC 11 |
+          | 5.0 | \`r5.0.32\` | SCons | GCC 11 |
+          | 6.0 | \`r6.0.27\` | SCons | GCC 11 |
+          | 7.0 | \`r7.0.20\` | SCons | GCC 12 |
+          | 8.0 | \`r8.0.10\` | Bazel | GCC 14 |
+          | 8.2 | \`r8.2.6\`  | Bazel | GCC 14 |
+
+          > arm64 uses native \`ubuntu-22.04-arm\` runner — no QEMU.
+          SUMMARY
