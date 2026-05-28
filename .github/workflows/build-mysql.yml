@@ -102,6 +102,10 @@ jobs:
           req_arches   = os.environ.get('INPUT_ARCHES', 'amd64,arm64').split(',')
           req_arches   = [a.strip() for a in req_arches if a.strip()]
 
+          RUNNER_MAP = {
+            'amd64': 'ubuntu-latest',
+            'arm64': 'ubuntu-24.04-arm',
+          }
           include = []
           for ver in req_versions:
             if ver not in ALL_VERSIONS:
@@ -111,6 +115,7 @@ jobs:
               entry = dict(cfg)
               entry['build_arch'] = arch          # 用 build_arch 避免污染 make 系统变量
               entry['platform']   = f'linux/{arch}'
+              entry['runner']     = RUNNER_MAP.get(arch, 'ubuntu-latest')
               include.append(entry)
 
           event   = os.environ.get('GITHUB_EVENT_NAME', 'push')
@@ -237,7 +242,7 @@ jobs:
   build:
     name: "MySQL ${{ matrix.full_version }} / ${{ matrix.build_arch }}"
     needs: [prepare, download]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
       fail-fast: false
@@ -246,11 +251,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: linux/amd64,linux/arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
