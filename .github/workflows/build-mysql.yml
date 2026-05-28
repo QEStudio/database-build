@@ -121,14 +121,14 @@ jobs:
             release_tag    = ref.replace('refs/tags/', '')
             should_release = 'true'
           elif event == 'schedule':
-            release_tag    = f'nightly-{date_tag}'
+            release_tag    = f'mysql-nightly-{date_tag}'
             should_release = 'true'
           elif event in ('push', 'workflow_dispatch') and \
                ref in ('refs/heads/main', 'refs/heads/master'):
-            release_tag    = f'build-{date_tag}-{run_num}'
+            release_tag    = f'mysql-build-{date_tag}-{run_num}'
             should_release = 'true'
           else:
-            release_tag    = f'dev-{date_tag}'
+            release_tag    = f'mysql-dev-{date_tag}'
             should_release = 'false'
 
           matrix = json.dumps({'include': include})
@@ -961,7 +961,7 @@ jobs:
           NOTES
 
       - name: Delete existing nightly release
-        if: startsWith(needs.prepare.outputs.release_tag, 'nightly-')
+        if: startsWith(needs.prepare.outputs.release_tag, 'mysql-nightly-')
         run: |
           gh release delete "${{ needs.prepare.outputs.release_tag }}" \
             --yes --cleanup-tag 2>/dev/null || true
