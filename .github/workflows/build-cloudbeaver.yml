@@ -1,0 +1,273 @@
+name: Build CloudBeaver
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build CloudBeaver
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone CloudBeaver source
+        run: |
+          git clone --depth 1 \
+            https://github.com/dbeaver/cloudbeaver.git
+
+      - name: Extract version info
+        id: version
+        run: |
+          cd cloudbeaver
+
+          GIT_HASH=$(git rev-parse --short HEAD)
+          GIT_HASH_FULL=$(git rev-parse HEAD)
+          GIT_DATE=$(git log -1 --format='%cd' --date=format:'%Y%m%d')
+
+          PKG_VER=""
+          for f in package.json webapp/package.json; do
+            if [ -f "$f" ]; then
+              V=$(python3 -c \
+                "import json; d=json.load(open('$f')); print(d.get('version',''))" \
+                2>/dev/null || true)
+              if [ -n "$V" ]; then
+                PKG_VER="$V"
+                break
+              fi
+            fi
+          done
+
+          VERSION="${PKG_VER:-${GIT_DATE}}-${GIT_HASH}"
+          TAG="v${VERSION}"
+
+          echo "git_hash=${GIT_HASH}"           >> "$GITHUB_OUTPUT"
+          echo "git_hash_full=${GIT_HASH_FULL}" >> "$GITHUB_OUTPUT"
+          echo "git_date=${GIT_DATE}"           >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}"             >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                     >> "$GITHUB_OUTPUT"
+
+          echo "Version : ${VERSION}"
+          echo "Tag     : ${TAG}"
+
+      - name: Check if release already exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" \
+               --repo "${{ github.repository }}" &>/dev/null; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists, skip build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG not found, proceeding."
+          fi
+
+      - name: Set up Java 21
+        if: steps.check_release.outputs.exists == 'false'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Maven
+        if: steps.check_release.outputs.exists == 'false'
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: '3.9.9'
+
+      - name: Set up Node.js 22
+        if: steps.check_release.outputs.exists == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Yarn
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          echo "=== Detecting required Yarn version ==="
+
+          PM_FIELD=""
+          for f in \
+            cloudbeaver/package.json \
+            cloudbeaver/webapp/package.json \
+            cloudbeaver/deploy/package.json; do
+            if [ -f "$f" ]; then
+              PM=$(python3 -c \
+                "import json; d=json.load(open('$f')); print(d.get('packageManager',''))" \
+                2>/dev/null || true)
+              if [ -n "$PM" ]; then
+                PM_FIELD="$PM"
+                echo "Found packageManager='$PM' in $f"
+                break
+              fi
+            fi
+          done
+
+          if [ -z "$PM_FIELD" ]; then
+            if find cloudbeaver -name ".yarnrc.yml" | grep -q .; then
+              PM_FIELD="yarn@stable"
+              echo "Found .yarnrc.yml, will use yarn@stable"
+            fi
+          fi
+
+          if echo "$PM_FIELD" | grep -qE '^yarn@[2-9]'; then
+            echo "Installing Yarn Berry via corepack: $PM_FIELD"
+            corepack enable
+            corepack prepare "$PM_FIELD" --activate
+          else
+            echo "Installing Yarn Classic v1"
+            npm install -g yarn@1
+          fi
+
+          echo "Active yarn version: $(yarn --version)"
+
+      - name: Verify tools
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          echo "=== Tool Versions ==="
+          java  -version 2>&1
+          mvn   --version
+          node  --version
+          npm   --version
+          yarn  --version
+          echo "JAVA_HOME : $JAVA_HOME"
+          echo "====================="
+
+      - name: Configure Yarn immutable installs
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          YARN_MAJOR=$(yarn --version | cut -d. -f1)
+          if [ "$YARN_MAJOR" -ge 2 ]; then
+            echo "Yarn Berry: disabling immutable install for CI"
+            # --home 写入用户级配置，对 build.sh 内所有 yarn install 均生效
+            yarn config set enableImmutableInstalls false --home
+            echo "Current yarn config:"
+            yarn config --home 2>/dev/null || true
+          else
+            echo "Yarn Classic, skip."
+          fi
+
+      - name: Build CloudBeaver
+        if: steps.check_release.outputs.exists == 'false'
+        env:
+          MAVEN_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=512m"
+          # 双重保险：环境变量 + yarn config 均禁用 immutable 检查
+          YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
+        run: |
+          cd cloudbeaver/deploy
+
+          MAX_RETRY=2
+          COUNT=0
+
+          until bash build.sh; do
+            COUNT=$((COUNT + 1))
+            if [ "$COUNT" -ge "$MAX_RETRY" ]; then
+              echo "::error::Build failed after $((MAX_RETRY + 1)) attempts"
+              exit 1
+            fi
+            echo "::warning::Build failed (attempt $COUNT), retrying in 30s..."
+            # 只清理前端产物，不清理 Maven 本地缓存
+            rm -rf cloudbeaver
+            sleep 30
+          done
+
+          echo "Build succeeded"
+
+      - name: Verify build output
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          OUTPUT_DIR="cloudbeaver/deploy/cloudbeaver"
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "::error::Output directory not found: $OUTPUT_DIR"
+            ls -la cloudbeaver/deploy/ || true
+            exit 1
+          fi
+          echo "--- Output ---"
+          ls -lh "$OUTPUT_DIR/"
+          du -sh "$OUTPUT_DIR"
+
+      - name: Package artifact
+        if: steps.check_release.outputs.exists == 'false'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARTIFACT="cloudbeaver-${VERSION}.tar.gz"
+
+          tar -czf "$ARTIFACT" \
+            -C cloudbeaver/deploy \
+            cloudbeaver
+
+          sha256sum "$ARTIFACT" > "${ARTIFACT}.sha256"
+          cat "${ARTIFACT}.sha256"
+
+          echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
+          echo "Size: $(du -sh "${ARTIFACT}" | cut -f1)"
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          GIT_HASH="${{ steps.version.outputs.git_hash }}"
+          GIT_HASH_FULL="${{ steps.version.outputs.git_hash_full }}"
+          GIT_DATE="${{ steps.version.outputs.git_date }}"
+          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          ARTIFACT="${{ env.ARTIFACT }}"
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "CloudBeaver ${VERSION}" \
+            --notes "## CloudBeaver ${VERSION}
+
+          | 字段 | 值 |
+          |------|-----|
+          | 源码版本 | [\`${GIT_HASH}\`](https://github.com/dbeaver/cloudbeaver/commit/${GIT_HASH_FULL}) |
+          | 源码日期 | ${GIT_DATE} |
+          | 构建时间 | ${BUILD_TIME} |
+          | 构建环境 | ubuntu-latest / Temurin Java 21 / Maven 3.9.9 / Node 22 / Yarn |
+
+          ## 安装使用
+
+          \`\`\`bash
+          wget https://github.com/${{ github.repository }}/releases/download/${TAG}/${ARTIFACT}
+          sha256sum -c ${ARTIFACT}.sha256
+          tar -xzf ${ARTIFACT}
+          cd cloudbeaver && bash run-server.sh
+          \`\`\`" \
+            --latest \
+            "${ARTIFACT}" \
+            "${ARTIFACT}.sha256"
+
+          echo "Release created: $TAG"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            if [ "${{ steps.check_release.outputs.exists }}" == "true" ]; then
+              echo "### 已跳过构建"
+              echo ""
+              echo "Release \`${{ steps.version.outputs.tag }}\` 已存在。"
+            else
+              echo "### 构建完成"
+              echo ""
+              echo "| 项目 | 值 |"
+              echo "|------|-----|"
+              echo "| Tag | \`${{ steps.version.outputs.tag }}\` |"
+              echo "| Commit | \`${{ steps.version.outputs.git_hash }}\` |"
+              echo "| Artifact | \`${{ env.ARTIFACT }}\` |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
